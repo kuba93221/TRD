@@ -10,7 +10,6 @@ import signal
 import threading
 import gc         
 import requests
-import yfinance as yf
 from datetime import datetime
 from flask import Flask, jsonify
 from typing import Dict, Any, List, Optional
@@ -25,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Algorithmic_Trading_Engine_v6.0_DEV")
 
-logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota w bezpiecznej gałęzi DEV [Binance Testnet + Yahoo Finance]")
+logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota w bezpiecznej gałęzi DEV [Pancerny Rdzeń Binance Only]")
 
 BACKGROUND_LOOP = None
 PIPELINE_LOCK = None  
@@ -185,19 +184,6 @@ class BinanceTestnetClient:
         except Exception:
             return None
 
-class YahooFinanceClient:
-    """Pobiera darmowe dane dla Forexu i surowców bez konieczności logowania i tokenów."""
-    async def get_asset_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
-        try:
-            loop = asyncio.get_event_loop()
-            df = await loop.run_in_executor(None, lambda: yf.Ticker(symbol).history(period="1d"))
-            if not df.empty:
-                last_price = df['Close'].iloc[-1]
-                return {"source": "YAHOO_FINANCE", "symbol": symbol, "last": float(last_price)}
-            return None
-        except Exception:
-            return None
-
 # =========================================================================
 # CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE)
 # =========================================================================
@@ -209,7 +195,7 @@ async def run_async_pipeline():
         return
     
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [POTOK V3] Rozpoczynam zbieranie cen z Binance Testnet oraz Yahoo Finance...")
+        logger.info("🕵️ [POTOK V4] Pobieranie próbek z silnika Binance Testnet...")
         if RATE_LIMITER is None: 
             RATE_LIMITER = TokenBucketRateLimiter()
         
@@ -226,36 +212,35 @@ async def run_async_pipeline():
             )
             
             binance = BinanceTestnetClient(session, RATE_LIMITER)
-            yahoo = YahooFinanceClient()
             
-            # Krypto z Binance, Tradery z Yahoo Finance (EURUSD=X oraz GC=F dla Złota)
+            # Mapowanie rynków oparte w 100% o stabilną infrastrukturę Binance (Krypto + Syntetyczne EUR i GOLD)
             instruments = [
-                {"client": binance, "symbol": "BTCUSDT", "type": "CRYPTO"},
-                {"client": binance, "symbol": "ETHUSDT", "type": "CRYPTO"},
-                {"client": yahoo, "symbol": "EURUSD=X", "type": "FX"},
-                {"client": yahoo, "symbol": "GC=F", "type": "COMMODITY"}
+                {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT"},
+                {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT"},
+                {"client": binance, "symbol": "EURUSDT", "label": "EUR_USD"},
+                {"client": binance, "symbol": "PAXGUSDT", "label": "GOLD_XAU"}
             ]
             
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set(): 
                     break
                 
-                ticker = await inst["client"].get_market_ticker(inst["symbol"]) if inst["type"] == "CRYPTO" else await inst["client"].get_asset_ticker(inst["symbol"])
+                ticker = await inst["client"].get_market_ticker(inst["symbol"])
                 
                 if ticker:
-                    await redis_trade.push_historical_tick(inst["symbol"], ticker, max_elements=50)
-                    history = await redis_trade.get_historical_ticks(inst["symbol"], max_elements=50)
+                    await redis_trade.push_historical_tick(inst["label"], ticker, max_elements=50)
+                    history = await redis_trade.get_historical_ticks(inst["label"], max_elements=50)
                     
                     metrics = AlgorithmicQuantCore.calculate_z_score(history)
                     if metrics:
                         z = metrics["z_score"]
-                        logger.info(f"📊 [{inst['symbol']}] Price: {metrics['current']} | Z-Score: {z}")
-                        await redis_trade.incr_metric(f"ticks_{inst['symbol']}")
+                        logger.info(f"📊 [{inst['label']}] Price: {metrics['current']} | Z-Score: {z}")
+                        await redis_trade.incr_metric(f"ticks_{inst['label']}")
                         
                         if z <= -2.0:
-                            await tg.push(f"🟩 <b>[BUY SIGNAL - MEAN REVERSION]</b>\nInstrument: <b>{inst['symbol']}</b>\nZ-Score: <b>{z}</b> (Wyprzedanie)\nCena: <b>{metrics['current']}</b>")
+                            await tg.push(f"🟩 <b>[BUY SIGNAL]</b>\nRynek: <b>{inst['label']}</b>\nZ-Score: <b>{z}</b>\nCena: <b>{metrics['current']}</b>")
                         elif z >= 2.0:
-                            await tg.push(f"🟥 <b>[SELL SIGNAL - MEAN REVERSION]</b>\nInstrument: <b>{inst['symbol']}</b>\nZ-Score: <b>{z}</b> (Wykupienie)\nCena: <b>{metrics['current']}</b>")
+                            await tg.push(f"🟥 <b>[SELL SIGNAL]</b>\nRynek: <b>{inst['label']}</b>\nZ-Score: <b>{z}</b>\nCena: <b>{metrics['current']}</b>")
             
             gc.collect()
 
