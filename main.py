@@ -10,49 +10,29 @@ import signal
 import threading
 import gc         
 import requests
-from datetime import datetime, timedelta
+import yfinance as yf
+from datetime import datetime
 from flask import Flask, jsonify
 from typing import Dict, Any, List, Optional
 
 # =========================================================================
 # SYSTEMOWY MODUŁ OBSERVABILITY & GLOBAL CONTEXT
 # =========================================================================
-LOG_LEVEL_CONFIG = os.environ.get("LOG_LEVEL", "DEBUG").upper()  
+LOG_LEVEL_CONFIG = os.environ.get("LOG_LEVEL", "INFO").upper()  
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL_CONFIG, logging.DEBUG), 
+    level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO), 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Algorithmic_Trading_Engine_v5.5_DEV")
+logger = logging.getLogger("Algorithmic_Trading_Engine_v6.0_DEV")
 
-logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota w bezpiecznej gałęzi DEV (Crypto.com + XTB xAPI na Tokenach)")
+logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota w bezpiecznej gałęzi DEV [Binance Testnet + Yahoo Finance]")
 
 BACKGROUND_LOOP = None
 PIPELINE_LOCK = None  
 ASYNC_SHUTDOWN_EVENT = None 
 
-ASSET_MUTEXES: Dict[str, asyncio.Lock] = {}
-ASSET_MUTEX_LOCK = threading.Lock()
-
-def get_asset_lock(asset_id_str: str) -> asyncio.Lock:
-    with ASSET_MUTEX_LOCK:
-        if asset_id_str not in ASSET_MUTEXES:
-            ASSET_MUTEXES[asset_id_str] = asyncio.Lock()
-        return ASSET_MUTEXES[asset_id_str]
-
-def clear_asset_lock(asset_id_str: str):
-    with ASSET_MUTEX_LOCK:
-        if asset_id_str in ASSET_MUTEXES:
-            del ASSET_MUTEXES[asset_id_str]
-
-def sigterm_handler(signum, frame):
-    logger.info("📥 [SIGTERM] Sygnał zamknięcia od Render. Aktywacja Graceful Shutdown dla XTB i Crypto...")
-    if BACKGROUND_LOOP and ASYNC_SHUTDOWN_EVENT:
-        BACKGROUND_LOOP.call_soon_threadsafe(ASYNC_SHUTDOWN_EVENT.set)
-
-signal.signal(signal.SIGTERM, sigterm_handler)
-
 # =========================================================================
-# SERWER MONITORINGU FLASK (HEALTH CHECK & API ENDPOINTS)
+# SERWER MONITORINGU FLASK (URUCHAMIANY PRODUKCYJNIE NA RENDERZE)
 # =========================================================================
 app = Flask(__name__)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
@@ -85,7 +65,6 @@ class TokenBucketRateLimiter:
             self.last_check = now
             if self.tokens < 1.0:
                 wait_time = (1.0 - self.tokens) / self.rate
-                logger.debug(f"⏳ [RATE LIMITER] Oczekiwanie na token sieciowy: {wait_time:.4f}s...")
                 await asyncio.sleep(wait_time)
                 self.tokens = 0.0
                 self.last_check = time.monotonic()
@@ -105,36 +84,8 @@ class UpstashRedisTradingBridge:
     def _enforce_prefix(self, key: str) -> str:
         return key if key.startswith(self.prefix) else f"{self.prefix}{key}"
 
-    async def get_state(self, key: str) -> Optional[Dict[str, Any]]:
-        if not self.url: return None
-        safe_key = self._enforce_prefix(key)
-        try:
-            async with self.session.get(f"{self.url}/get/{safe_key}", headers=self.headers, timeout=4) as response:
-                if response.status != 200: return None
-                hex_res = (await response.json()).get("result")
-                if hex_res and hex_res not in ["None", "NULL"]:
-                    return msgpack.unpackb(bytes.fromhex(hex_res), strict_map_key=False)
-                return None
-        except Exception as e:
-            logger.error(f"❌ [REDIS GET ERROR] Błąd klucza {safe_key}: {e}")
-            return None
-
-    async def set_state(self, key: str, value: Dict[str, Any], ttl: Optional[int] = 86400) -> bool:
-        if not self.url: return False
-        safe_key = self._enforce_prefix(key)
-        try:
-            hex_str = msgpack.packb(value, use_bin_type=True).hex()
-            suffix = f"?EX={ttl}" if ttl else ""
-            async with self.session.get(f"{self.url}/set/{safe_key}/{hex_str}{suffix}", headers=self.headers, timeout=4) as response:
-                if response.status == 200:
-                    await response.read()
-                    return True
-                return False
-        except Exception as e:
-            logger.error(f"❌ [REDIS SET ERROR] Błąd zapisu {safe_key}: {e}")
-            return False
-
     async def push_historical_tick(self, market_id: str, tick_data: Dict[str, Any], max_elements: int = 50) -> bool:
+        """Wpycha najświeższą cenę do kolejki kołowej Redis (FIFO)."""
         if not self.url: return False
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
@@ -148,8 +99,22 @@ class UpstashRedisTradingBridge:
                     return True
                 return False
         except Exception as e:
-            logger.error(f"❌ [REDIS FIFO ERROR] Blad kolejki dla {market_id}: {e}")
+            logger.error(f"❌ [REDIS FIFO ERROR] Błąd kolejki dla {market_id}: {e}")
             return False
+
+    async def get_historical_ticks(self, market_id: str, max_elements: int = 50) -> List[Dict[str, Any]]:
+        """Pobiera zmagazynowaną serię czasową próbek cenowych dla wskaźnika Z-Score."""
+        if not self.url: return []
+        safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
+        try:
+            url = f"{self.url}/lrange/{safe_key}/0/{max_elements - 1}"
+            async with self.session.get(url, headers=self.headers, timeout=4) as response:
+                if response.status != 200: return []
+                hex_list = (await response.json()).get("result", [])
+                return [msgpack.unpackb(bytes.fromhex(h), strict_map_key=False) for h in hex_list if h and h not in ["None", "NULL"]]
+        except Exception as e:
+            logger.error(f"❌ [REDIS LRANGE ERROR] {market_id}: {e}")
+            return []
 
     async def incr_metric(self, field_name: str):
         if not self.url: return
@@ -161,142 +126,80 @@ class UpstashRedisTradingBridge:
             pass
 
 # =========================================================================
-# MOSTEK POWIADOMIEŃ TELEGRAM (PACZKOWANIE KOMUNIKATÓW)
+# MOSTEK POWIADOMIEŃ TELEGRAM
 # =========================================================================
 class TelegramThrottledDispatcher:
     def __init__(self, token: str, chat_id: str, session: aiohttp.ClientSession):
         self.token = token
         self.chat_id = chat_id
         self.session = session
-        self.buffer: List[str] = []
-        self.batch_size = 5
-        self._lock = None  
 
-    async def push(self, text: str, json_payload: Dict[str, Any]):
-        if self._lock is None: 
-            self._lock = asyncio.Lock()
-        async with self._lock:
-            self.buffer.append(text)
-            if len(self.buffer) >= self.batch_size: 
-                await self._flush_buffer()
-
-    async def force_flush(self):
-        if self._lock is None: 
-            self._lock = asyncio.Lock()
-        async with self._lock:
-            if self.buffer: 
-                await self._flush_buffer()
-
-    async def _flush_buffer(self):
-        if not self.token or not self.chat_id:
-            self.buffer.clear()
-            return
+    async def push(self, text: str):
+        if not self.token or not self.chat_id: return
         try:
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            payload = {
-                "chat_id": self.chat_id, 
-                "text": "\n\n=====================\n\n".join(self.buffer), 
-                "parse_mode": "HTML"
-            }
+            payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
             async with self.session.post(url, json=payload, timeout=10) as response: 
                 await response.read()
-            self.buffer.clear()
-            await asyncio.sleep(2.0)
         except Exception: 
             pass
 
 # =========================================================================
-# BROKER CORE 1: ASYNCHRONICZNY KLIENT CRYPTO.COM (REST API)
+# RDZEŃ QUANT: ANALIZA STATYSTYCZNA Z-SCORE (MEAN REVERSION)
 # =========================================================================
-class CryptoComExchangeClient:
+class AlgorithmicQuantCore:
+    """Ultra-lekki aparat matematyczny. Wylicza standaryzowane odchylenie Z-Score."""
+    @staticmethod
+    def calculate_z_score(ticks: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        prices = [float(t.get("last", 0)) for t in ticks if t.get("last")]
+        n = len(prices)
+        if n < 10: return None  # Minimalna wielkość próby statystycznej
+
+        sma = sum(prices) / n
+        variance = sum((x - sma) ** 2 for x in prices) / n
+        std_dev = math.sqrt(variance)
+        if std_dev == 0: std_dev = 1e-6
+        
+        current_price = prices[0]
+        z_score = (current_price - sma) / std_dev
+        return {"current": current_price, "sma": round(sma, 6), "z_score": round(z_score, 4)}
+
+# =========================================================================
+# NOWE MODUŁY POBIERANIA DANYCH RYNKOWYCH V3
+# =========================================================================
+class BinanceTestnetClient:
+    """Pobiera publiczne ceny spot z oficjalnego środowiska testowego Binance."""
     def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter):
-        self.base_url = "https://api.crypto.com/v2"
+        self.base_url = "https://testnet.binance.vision/api/v3"
         self.session = session
         self.rate_limiter = rate_limiter
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         await self.rate_limiter.consume()
         try:
-            async with self.session.get(f"{self.base_url}/public/get-ticker?instrument_name={symbol}", timeout=5) as response:
+            url = f"{self.base_url}/ticker/price?symbol={symbol}"
+            async with self.session.get(url, timeout=5) as response:
                 if response.status != 200: return None
-                data_list = (await response.json()).get("result", {}).get("data", [])
-                if data_list:
-                    ticker = data_list[0]
-                    return {
-                        "source": "CRYPTO_COM", 
-                        "symbol": symbol,
-                        "bid": float(ticker.get("b", 0)), 
-                        "ask": float(ticker.get("k", 0)), 
-                        "last": float(ticker.get("a", 0)),
-                        "timestamp": int(time.time() * 1000)
-                    }
-                return None
-        except Exception as e:
-            logger.error(f"❌ [CRYPTO.COM TICKER ERROR] Awaria pobierania ceny dla {symbol}: {e}")
+                data = await response.json()
+                return {"source": "BINANCE_TESTNET", "symbol": symbol, "last": float(data.get("price", 0))}
+        except Exception:
             return None
 
-# =========================================================================
-# BROKER CORE 2: BEZPIECZNY KLIENT GIEŁDY XTB (PROTOKÓŁ xAPI WEBSOCKET)
-# =========================================================================
-class XtbXapiExchangeClient:
-    """
-    Asynchroniczny klient giełdy XTB oparty w 100% na bezpiecznej autoryzacji tokenowej.
-    BRAK przetwarzania haseł i loginów użytkownika w kodzie bota.
-    """
-    def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter):
-        self.session = session
-        self.rate_limiter = rate_limiter
-        self.ws_url = "wss://ws.xtb.com/demo"
-        # Pobieranie sprofilowanych, bezpiecznych kluczy bez uprawnień do wypłat
-        self.app_key = os.environ.get("XTB_APP_KEY", "")
-        self.app_token = os.environ.get("XTB_APP_TOKEN", "")
-
+class YahooFinanceClient:
+    """Pobiera darmowe dane dla Forexu i surowców bez konieczności logowania i tokenów."""
     async def get_asset_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Loguje się przy użyciu bezpiecznego klucza i tokenu aplikacji, pobiera cenę i zamyka gniazdo."""
-        if not self.app_key or not self.app_token:
-            logger.error("❌ [XTB AUTH SECURITY BREACH] Brak wymaganych kluczy XTB_APP_KEY / XTB_APP_TOKEN w środowisku!")
-            return None
-
-        await self.rate_limiter.consume()
         try:
-            async with self.session.ws_connect(self.ws_url, timeout=10) as ws:
-                # Krok 1: Tokenowa komenda logowania (Zgodna ze standardem xAPI)
-                login_cmd = {
-                    "command": "loginWithToken",
-                    "arguments": {
-                        "appKey": self.app_key,
-                        "token": self.app_token
-                    }
-                }
-                await ws.send_str(json.dumps(login_cmd))
-                
-                login_resp = await ws.receive_json(timeout=5)
-                if not login_resp.get("status"):
-                    logger.error("❌ [XTB TOKEN AUTH FAILED] Giełda odrzuciła token autoryzacyjny aplikacji.")
-                    return None
-                
-                # Krok 2: Odpytanie o stan kwotowania instrumentu
-                price_cmd = {"command": "getSymbol", "arguments": {"symbol": symbol}}
-                await ws.send_str(json.dumps(price_cmd))
-                
-                price_resp = await ws.receive_json(timeout=5)
-                if price_resp.get("status") and "returnArgument" in price_resp:
-                    symbol_info = price_resp["returnArgument"]
-                    return {
-                        "source": "XTB", 
-                        "symbol": symbol,
-                        "bid": float(symbol_info.get("bid", 0)), 
-                        "ask": float(symbol_info.get("ask", 0)), 
-                        "last": float(symbol_info.get("ask", 0)),
-                        "timestamp": int(time.time() * 1000)
-                    }
-                return None
-        except Exception as e:
-            logger.error(f"❌ [XTB xAPI WEBSOCKET ERROR] Krytyczny błąd połączenia dla {symbol}: {e}")
+            loop = asyncio.get_event_loop()
+            df = await loop.run_in_executor(None, lambda: yf.Ticker(symbol).history(period="1d"))
+            if not df.empty:
+                last_price = df['Close'].iloc[-1]
+                return {"source": "YAHOO_FINANCE", "symbol": symbol, "last": float(last_price)}
+            return None
+        except Exception:
             return None
 
 # =========================================================================
-# GŁÓWNY ASYNCHRONICZNY POTOK TRADINGOWY (PIPELINE)
+# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE)
 # =========================================================================
 async def run_async_pipeline():
     global RATE_LIMITER, PIPELINE_LOCK
@@ -306,7 +209,7 @@ async def run_async_pipeline():
         return
     
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [HYBRID PIPELINE] Inicjalizacja asynchronicznego skanowania Crypto.com oraz XTB...")
+        logger.info("🕵️ [POTOK V3] Rozpoczynam zbieranie cen z Binance Testnet oraz Yahoo Finance...")
         if RATE_LIMITER is None: 
             RATE_LIMITER = TokenBucketRateLimiter()
         
@@ -316,48 +219,55 @@ async def run_async_pipeline():
                 os.environ.get("UPSTASH_REDIS_REST_TOKEN", ""), 
                 session
             )
+            tg = TelegramThrottledDispatcher(
+                os.environ.get("TELEGRAM_BOT_TOKEN", ""), 
+                os.environ.get("TELEGRAM_CHANNEL_ID", ""), 
+                session
+            )
             
-            # 1. CYKL CRYPTO.COM REST API
-            crypto_client = CryptoComExchangeClient(session, RATE_LIMITER)
-            for symbol in ["BTC_USDT", "ETH_USDT"]:
+            binance = BinanceTestnetClient(session, RATE_LIMITER)
+            yahoo = YahooFinanceClient()
+            
+            # Krypto z Binance, Tradery z Yahoo Finance (EURUSD=X oraz GC=F dla Złota)
+            instruments = [
+                {"client": binance, "symbol": "BTCUSDT", "type": "CRYPTO"},
+                {"client": binance, "symbol": "ETHUSDT", "type": "CRYPTO"},
+                {"client": yahoo, "symbol": "EURUSD=X", "type": "FX"},
+                {"client": yahoo, "symbol": "GC=F", "type": "COMMODITY"}
+            ]
+            
+            for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set(): 
                     break
-                ticker = await crypto_client.get_market_ticker(symbol)
+                
+                ticker = await inst["client"].get_market_ticker(inst["symbol"]) if inst["type"] == "CRYPTO" else await inst["client"].get_asset_ticker(inst["symbol"])
+                
                 if ticker:
-                    await redis_trade.push_historical_tick(symbol, ticker, max_elements=50)
-                    await redis_trade.incr_metric("crypto_ticks")
-                    logger.info(f"🪙 [CRYPTO RECORD] Zapisano {symbol} -> Ostatnia cena: {ticker['last']}")
-
-            # 2. CYKL XTB xAPI WEBSOCKET
-            xtb_client = XtbXapiExchangeClient(session, RATE_LIMITER)
-            for symbol in ["EURUSD", "GOLD"]:
-                if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set(): 
-                    break
-                ticker = await xtb_client.get_asset_ticker(symbol)
-                if ticker:
-                    await redis_trade.push_historical_tick(symbol, ticker, max_elements=50)
-                    await redis_trade.incr_metric("xtb_ticks")
-                    logger.info(f"📈 [XTB RECORD] Zapisano {symbol} -> Cena Ask: {ticker['ask']}")
+                    await redis_trade.push_historical_tick(inst["symbol"], ticker, max_elements=50)
+                    history = await redis_trade.get_historical_ticks(inst["symbol"], max_elements=50)
+                    
+                    metrics = AlgorithmicQuantCore.calculate_z_score(history)
+                    if metrics:
+                        z = metrics["z_score"]
+                        logger.info(f"📊 [{inst['symbol']}] Price: {metrics['current']} | Z-Score: {z}")
+                        await redis_trade.incr_metric(f"ticks_{inst['symbol']}")
+                        
+                        if z <= -2.0:
+                            await tg.push(f"🟩 <b>[BUY SIGNAL - MEAN REVERSION]</b>\nInstrument: <b>{inst['symbol']}</b>\nZ-Score: <b>{z}</b> (Wyprzedanie)\nCena: <b>{metrics['current']}</b>")
+                        elif z >= 2.0:
+                            await tg.push(f"🟥 <b>[SELL SIGNAL - MEAN REVERSION]</b>\nInstrument: <b>{inst['symbol']}</b>\nZ-Score: <b>{z}</b> (Wykupienie)\nCena: <b>{metrics['current']}</b>")
             
-            # Wymuszenie czyszczenia nieużywanych obiektów w RAM dla maszyn Render < 512 MB
             gc.collect()
 
 # =========================================================================
-# MENEDŻER CRONA SYSTEMOWEGO (TAKTOWANIE CO 2 MINUTY)
+# ASYNCHRONICZNY CRON I WĄTEK SPOCZYNKOWY
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT
-    logger.info("⚡ [TRADING ONLINE] Silnik giełdowy wszedł w tryb aktywnego monitorowania rynków.")
+    logger.info("⚡ [TRADING ONLINE] Silnik matematyczny gotowy na wyzwalanie zewnętrzne przez endpoint.")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
-    
     while not ASYNC_SHUTDOWN_EVENT.is_set():
-        await run_async_pipeline()
-        
-        # Bezpieczne próbkowanie flagi zamknięcia procesu (Graceful Shutdown Co 10s)
-        for _ in range(12):
-            if ASYNC_SHUTDOWN_EVENT.is_set(): 
-                break
-            await asyncio.sleep(10)
+        await asyncio.sleep(5)
 
 def background_scheduler_thread():
     global BACKGROUND_LOOP
@@ -372,14 +282,17 @@ def background_scheduler_thread():
         loop.close()
 
 # =========================================================================
-# ATOMOWY EKSPORT METRYK PIPELINE (0 MB RAM OVERHEAD)
+# PUBLICZNE ENDPOINTY STERUJĄCE (DLA CRON-JOB.ORG)
 # =========================================================================
+@app.route('/run-analysis', methods=['GET', 'POST'])
+def manual_analysis_trigger():
+    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running(): 
+        return jsonify({"status": "error", "message": "Potok tradingu nie jest gotowy."}), 500
+    asyncio.run_coroutine_threadsafe(run_async_pipeline(), BACKGROUND_LOOP)
+    return jsonify({"status": "success", "message": "Analiza rynków uruchomiona pomyślnie."}), 200
+
 @app.route('/export-analytics', methods=['GET'])
 def export_analytics_safe_json():
-    """Pobiera i atomowo usuwa wyłącznie dane z prefiksem TRADE_ANALYTICS za pomocą żądania pakietowego Pipeline."""
-    logger.info("📊 [ENDPOINT] Żążądanie zrzutu metryk tradingu.")
-    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
-        return jsonify({"status": "error", "message": "Pętla tła tradingu jest niedostępna"}), 503
     try:
         r_url = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip('/')
         r_tok = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
@@ -388,7 +301,7 @@ def export_analytics_safe_json():
         keys_resp = requests.get(f"{r_url}/keys/TRADE_ANALYTICS:*", headers=headers, timeout=10)
         r_keys = keys_resp.json().get("result", [])
         if not r_keys: 
-            return jsonify({"status": "success", "message": "Brak danych giełdowych do eksportu", "trading_data": []}), 200
+            return jsonify({"status": "success", "trading_data": []}), 200
             
         pipeline_payload = [["MGET"] + r_keys, ["DEL"] + r_keys]
         pipeline_result = requests.post(f"{r_url}/pipeline", json=pipeline_payload, headers=headers, timeout=15).json().get("result", [])
@@ -396,8 +309,7 @@ def export_analytics_safe_json():
         
         trading_output = []
         for index, key in enumerate(r_keys):
-            if index >= len(r_values): 
-                break
+            if index >= len(r_values): break
             parts = key.split(":")
             trading_output.append({
                 "data": parts[2] if len(parts) > 2 else "??",
@@ -407,13 +319,6 @@ def export_analytics_safe_json():
         return jsonify({"status": "success", "trading_count": len(trading_output), "trading_data": trading_output}), 200
     except Exception as e: 
         return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/run-analysis', methods=['GET', 'POST'])
-def manual_analysis_trigger():
-    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running(): 
-        return jsonify({"status": "error", "message": "Potok tradingu nie jest gotowy."}), 500
-    asyncio.run_coroutine_threadsafe(run_async_pipeline(), BACKGROUND_LOOP)
-    return jsonify({"status": "success", "message": "Potok tradingowy wymuszony ręcznie."}), 200
 
 if __name__ == "__main__":
     worker_thread = threading.Thread(target=background_scheduler_thread, daemon=True)
