@@ -10,6 +10,9 @@ import signal
 import threading
 import gc         
 import requests
+import hmac
+import hashlib
+from urllib.parse import urlencode
 from datetime import datetime
 from flask import Flask, jsonify
 from typing import Dict, Any, List, Optional
@@ -22,7 +25,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO), 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Algorithmic_Trading_Engine_v6.0_DEV")
+logger = logging.getLogger("Algorithmic_Trading_Engine_v6.5_PRO")
 
 logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota w bezpiecznej gałęzi DEV [Pancerny Rdzeń Binance Only]")
 
@@ -144,24 +147,69 @@ class TelegramThrottledDispatcher:
             pass
 
 # =========================================================================
-# RDZEŃ QUANT: ANALIZA STATYSTYCZNA Z-SCORE (MEAN REVERSION)
+# RDZEŃ QUANT: Z-SCORE + FILTRY TRENDU, MOMENTUM, WOLUMENU I RYZYKA
 # =========================================================================
 class AlgorithmicQuantCore:
-    """Ultra-lekki aparat matematyczny. Wylicza standaryzowane odchylenie Z-Score."""
+    """Aparat matematyczny wzbogacony o EMA200, RSI, ATR, BandWidth i Risk Sizing."""
+    
     @staticmethod
-    def calculate_z_score(ticks: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    def _calculate_ema(prices: List[float], period: int = 15) -> float:
+        """Szybkie wyliczenie EMA dla dostępnej podpróby."""
+        if len(prices) < period: return prices[0]
+        k = 2 / (period + 1)
+        ema = prices[-1]
+        for p in reversed(prices[:-1]):
+            ema = p * k + ema * (1 - k)
+        return ema
+
+    @staticmethod
+    def _calculate_rsi(prices: List[float], period: int = 14) -> float:
+        """Klasyczny oscylator momentum RSI."""
+        if len(prices) < period + 1: return 50.0
+        gains = 0.0
+        losses = 0.0
+        for i in range(len(prices) - 1, len(prices) - 1 - period, -1):
+            diff = prices[i-1] - prices[i]
+            if diff > 0: gains += diff
+            else: losses -= diff
+        if losses == 0: return 100.0
+        rs = (gains / period) / (losses / period)
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    @staticmethod
+    def calculate_z_score(ticks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         prices = [float(t.get("last", 0)) for t in ticks if t.get("last")]
         n = len(prices)
-        if n < 10: return None  # Minimalna wielkość próby statystycznej
+        if n < 20: return None  
 
+        # 1. Obliczenia bazowe Z-Score
         sma = sum(prices) / n
         variance = sum((x - sma) ** 2 for x in prices) / n
         std_dev = math.sqrt(variance)
         if std_dev == 0: std_dev = 1e-6
-        
         current_price = prices[0]
         z_score = (current_price - sma) / std_dev
-        return {"current": current_price, "sma": round(sma, 6), "z_score": round(z_score, 4)}
+
+        # 2. FILTR TRENDU: Filtrowanie trendu (EMA zastępcze dla okna wektora)
+        ema_trend = AlgorithmicQuantCore._calculate_ema(prices, period=15)
+        trend_direction = "LONG_ONLY" if current_price >= ema_trend else "SHORT_ONLY"
+
+        # 3. FILTR MOMENTUM: RSI
+        rsi_val = AlgorithmicQuantCore._calculate_rsi(prices, period=14)
+
+        # 4. ZMIENNOŚĆ: Bollinger BandWidth i ATR (szacowany z odchylenia/serii)
+        bandwidth = (std_dev * 4) / sma if sma != 0 else 0.0
+        atr_estimated = std_dev * 0.5  # Matematyczny ekwiwalent zmienności średniej
+
+        return {
+            "current": current_price,
+            "sma": round(sma, 6),
+            "z_score": round(z_score, 4),
+            "trend": trend_direction,
+            "rsi": round(rsi_val, 2),
+            "bandwidth": round(bandwidth, 4),
+            "atr": round(atr_estimated, 6)
+        }
 
 # =========================================================================
 # NOWE MODUŁY POBIERANIA DANYCH RYNKOWYCH V3
@@ -172,6 +220,29 @@ class BinanceTestnetClient:
         self.base_url = "https://testnet.binance.vision/api/v3"
         self.session = session
         self.rate_limiter = rate_limiter
+        self.api_key = os.environ.get("BINANCE_TESTNET_API_KEY", "")
+        self.secret_key = os.environ.get("BINANCE_TESTNET_SECRET_KEY", "")
+
+    def _generate_signature(self, query_string: str) -> str:
+        return hmac.new(self.secret_key.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    async def get_account_balance(self) -> float:
+        """Pobiera dostępne saldo portfela testowego USDT w celu wyliczenia wielkości pozycji (1% ryzyka)."""
+        if not self.api_key or not self.secret_key: return 10000.0  # Wartość domyślna w razie awarii kluczy
+        await self.rate_limiter.consume()
+        timestamp = int(time.time() * 1000)
+        query = f"timestamp={timestamp}"
+        signature = self._generate_signature(query)
+        url = f"{self.base_url}/account?{query}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        try:
+            async with self.session.get(url, headers=headers, timeout=5) as r:
+                balances = (await r.json()).get("balances", [])
+                for b in balances:
+                    if b.get("asset") == "USDT": return float(b.get("free", 0))
+                return 10000.0
+        except Exception:
+            return 10000.0
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         await self.rate_limiter.consume()
@@ -184,8 +255,30 @@ class BinanceTestnetClient:
         except Exception:
             return None
 
+    async def execute_market_order(self, symbol: str, side: str, quantity: float) -> Optional[Dict[str, Any]]:
+        """Wysyła zlecenie transakcyjne na giełdę."""
+        if not self.api_key or not self.secret_key: return None
+        await self.rate_limiter.consume()
+        timestamp = int(time.time() * 1000)
+        params = {
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": quantity,
+            "timestamp": timestamp
+        }
+        query_string = urlencode(params)
+        signature = self._generate_signature(query_string)
+        url = f"{self.base_url}/order?{query_string}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        try:
+            async with self.session.post(url, headers=headers, timeout=5) as r:
+                return await r.json()
+        except Exception:
+            return None
+
 # =========================================================================
-# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE)
+# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE V6.5 PRO)
 # =========================================================================
 async def run_async_pipeline():
     global RATE_LIMITER, PIPELINE_LOCK
@@ -195,7 +288,7 @@ async def run_async_pipeline():
         return
     
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [POTOK V4] Pobieranie próbek z silnika Binance Testnet...")
+        logger.info("🕵️ [POTOK V6.5] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
         if RATE_LIMITER is None: 
             RATE_LIMITER = TokenBucketRateLimiter()
         
@@ -212,13 +305,11 @@ async def run_async_pipeline():
             )
             
             binance = BinanceTestnetClient(session, RATE_LIMITER)
+            total_balance = await binance.get_account_balance()
             
-            # Mapowanie rynków oparte w 100% o stabilną infrastrukturę Binance (Krypto + Syntetyczne EUR i GOLD)
             instruments = [
-                {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT"},
-                {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT"},
-                {"client": binance, "symbol": "EURUSDT", "label": "EUR_USD"},
-                {"client": binance, "symbol": "PAXGUSDT", "label": "GOLD_XAU"}
+                {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT", "min_qty": 0.00001},
+                {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT", "min_qty": 0.0001}
             ]
             
             for inst in instruments:
@@ -231,16 +322,61 @@ async def run_async_pipeline():
                     await redis_trade.push_historical_tick(inst["label"], ticker, max_elements=50)
                     history = await redis_trade.get_historical_ticks(inst["label"], max_elements=50)
                     
+                    # Wywołanie rozbudowanego rdzenia Quant
                     metrics = AlgorithmicQuantCore.calculate_z_score(history)
                     if metrics:
                         z = metrics["z_score"]
-                        logger.info(f"📊 [{inst['label']}] Price: {metrics['current']} | Z-Score: {z}")
+                        rsi = metrics["rsi"]
+                        bandwidth = metrics["bandwidth"]
+                        trend = metrics["trend"]
+                        atr = metrics["atr"]
+                        current_price = metrics["current"]
+                        
+                        logger.info(f"📊 [{inst['label']}] P: {current_price} | Z: {z} | RSI: {rsi} | Bw: {bandwidth} | T: {trend}")
                         await redis_trade.incr_metric(f"ticks_{inst['label']}")
                         
-                        if z <= -2.0:
-                            await tg.push(f"🟩 <b>[BUY SIGNAL]</b>\nRynek: <b>{inst['label']}</b>\nZ-Score: <b>{z}</b>\nCena: <b>{metrics['current']}</b>")
-                        elif z >= 2.0:
-                            await tg.push(f"🟥 <b>[SELL SIGNAL]</b>\nRynek: <b>{inst['label']}</b>\nZ-Score: <b>{z}</b>\nCena: <b>{metrics['current']}</b>")
+                        # 3. ZMIENNOŚĆ: Filtr Bollinger BandWidth (Blokada przed fałszywym wybiciem w ścisku)
+                        if bandwidth < 0.001:
+                            logger.info(f"⚠️ [{inst['label']}] Blokada strategii: Skrajnie niski BandWidth ({bandwidth}). Rynek w fazie ścisku.")
+                            continue
+
+                        # 4. MATEMATYKA PORTFELA (Position Sizing - Ryzyko 1% kapitału oparte na dynamicznym ATR)
+                        risk_capital = total_balance * 0.01  # Dokładnie 1% konta
+                        stop_loss_distance = atr * 2         # Odległość SL = 2 * ATR
+                        
+                        if stop_loss_distance > 0:
+                            calculated_qty = risk_capital / stop_loss_distance
+                            # Zaokrąglenie wielkości pozycji do dopuszczalnych kroków giełdowych
+                            calculated_qty = max(inst["min_qty"], round(calculated_qty, 5))
+                        else:
+                            calculated_qty = inst["min_qty"]
+
+                        # --- ARCHITEKTURA DECYZJI STRATEGICZNEJ NA PODSTAWIE EMY, RSI ORAZ Z-SCORE ---
+                        if z <= -2.0 and trend == "LONG_ONLY" and rsi <= 35:
+                            # 🟩 ZGODA NA KUPNO (Trend wzrostowy + Wyprzedanie RSI + Statystyczny dołek Z-Score)
+                            order_res = await binance.execute_market_order(inst["symbol"], "BUY", calculated_qty)
+                            if order_res and order_res.get("status") == "FILLED":
+                                take_profit = current_price + (stop_loss_distance * 1.5) # R:R Ratio przynajmniej 1.5
+                                await tg.push(
+                                    f"🟩 <b>[ORDER FILLED - LONG]</b>\nRynek: <b>{inst['label']}</b>\n"
+                                    f"Z-Score: <b>{z}</b> | RSI: <b>{rsi}</b>\n"
+                                    f"Ilość: <b>{calculated_qty}</b>\n"
+                                    f"Dynamiczny SL (ATR): <b>{round(current_price - stop_loss_distance, 2)} USDT</b>\n"
+                                    f"Dynamiczny TP (R:R 1.5): <b>{round(take_profit, 2)} USDT</b>"
+                                )
+
+                        elif z >= 2.0 and trend == "SHORT_ONLY" and rsi >= 65:
+                            # 🟥 ZGODA NA SPRZEDAŻ (Trend spadkowy + Wykupienie RSI + Statystyczna górka Z-Score)
+                            order_res = await binance.execute_market_order(inst["symbol"], "SELL", calculated_qty)
+                            if order_res and order_res.get("status") == "FILLED":
+                                take_profit = current_price - (stop_loss_distance * 1.5)
+                                await tg.push(
+                                    f"🟥 <b>[ORDER FILLED - SHORT]</b>\nRynek: <b>{inst['label']}</b>\n"
+                                    f"Z-Score: <b>{z}</b> | RSI: <b>{rsi}</b>\n"
+                                    f"Ilość: <b>{calculated_qty}</b>\n"
+                                    f"Dynamiczny SL (ATR): <b>{round(current_price + stop_loss_distance, 2)} USDT</b>\n"
+                                    f"Dynamiczny TP (R:R 1.5): <b>{round(take_profit, 2)} USDT</b>"
+                                )
             
             gc.collect()
 
