@@ -25,7 +25,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO), 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Algorithmic_Trading_Engine_v6.5_PRO")
+logger = logging.getLogger("Algorithmic_Trading_Engine_v7.0_PRO")
 
 logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota w bezpiecznej gałęzi DEV [Pancerny Rdzeń Binance Only]")
 
@@ -92,6 +92,7 @@ class UpstashRedisTradingBridge:
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
             hex_str = msgpack.packb(tick_data, use_bin_type=True).hex()
+            logger.debug(f"[REDIS-DEBUG] Próba wykonania LPUSH dla {safe_key}")
             async with self.session.get(f"{self.url}/lpush/{safe_key}/{hex_str}", headers=self.headers, timeout=3) as resp:
                 if resp.status != 200: return False
                 await resp.read()
@@ -110,6 +111,7 @@ class UpstashRedisTradingBridge:
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
             url = f"{self.url}/lrange/{safe_key}/0/{max_elements - 1}"
+            logger.debug(f"[REDIS-DEBUG] Pobieranie serii LRANGE dla {safe_key}")
             async with self.session.get(url, headers=self.headers, timeout=4) as response:
                 if response.status != 200: return []
                 hex_list = (await response.json()).get("result", [])
@@ -180,7 +182,9 @@ class AlgorithmicQuantCore:
     def calculate_z_score(ticks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         prices = [float(t.get("last", 0)) for t in ticks if t.get("last")]
         n = len(prices)
-        if n < 20: return None  
+        if n < 20: 
+            logger.debug(f"[QUANT-DEBUG] Niewystarczająca próba danych: {n}/20 próbek. Pomijam kalkulację.")
+            return None  
 
         # 1. Obliczenia bazowe Z-Score
         sma = sum(prices) / n
@@ -228,7 +232,9 @@ class BinanceTestnetClient:
 
     async def get_account_balance(self) -> float:
         """Pobiera dostępne saldo portfela testowego USDT w celu wyliczenia wielkości pozycji (1% ryzyka)."""
-        if not self.api_key or not self.secret_key: return 10000.0  # Wartość domyślna w razie awarii kluczy
+        if not self.api_key or not self.secret_key: 
+            logger.debug("[BINANCE-DEBUG] Brak zdefiniowanych kluczy API. Zwracam saldo awaryjne 10000 USDT.")
+            return 10000.0  
         await self.rate_limiter.consume()
         timestamp = int(time.time() * 1000)
         query = f"timestamp={timestamp}"
@@ -237,11 +243,16 @@ class BinanceTestnetClient:
         headers = {"X-MBX-APIKEY": self.api_key}
         try:
             async with self.session.get(url, headers=headers, timeout=5) as r:
-                balances = (await r.json()).get("balances", [])
+                data = await r.json()
+                balances = data.get("balances", [])
                 for b in balances:
-                    if b.get("asset") == "USDT": return float(b.get("free", 0))
+                    if b.get("asset") == "USDT": 
+                        free_usdt = float(b.get("free", 0))
+                        logger.debug(f"[BINANCE-DEBUG] Pobrane saldo konta testowego: {free_usdt} USDT")
+                        return free_usdt
                 return 10000.0
-        except Exception:
+        except Exception as e:
+            logger.error(f"[BINANCE-ERROR] Błąd pobierania salda: {e}")
             return 10000.0
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -249,10 +260,13 @@ class BinanceTestnetClient:
         try:
             url = f"{self.base_url}/ticker/price?symbol={symbol}"
             async with self.session.get(url, timeout=5) as response:
-                if response.status != 200: return None
+                if response.status != 200: 
+                    logger.debug(f"[BINANCE-DEBUG] {symbol} błąd HTTP {response.status}")
+                    return None
                 data = await response.json()
                 return {"source": "BINANCE_TESTNET", "symbol": symbol, "last": float(data.get("price", 0))}
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[BINANCE-DEBUG] Wyjątek połączenia dla {symbol}: {e}")
             return None
 
     async def execute_market_order(self, symbol: str, side: str, quantity: float) -> Optional[Dict[str, Any]]:
@@ -273,22 +287,26 @@ class BinanceTestnetClient:
         headers = {"X-MBX-APIKEY": self.api_key}
         try:
             async with self.session.post(url, headers=headers, timeout=5) as r:
-                return await r.json()
-        except Exception:
+                res_data = await r.json()
+                logger.debug(f"[TRANSACTION-RESPONSE] Odpowiedź silnika Binance: {res_data}")
+                return res_data
+        except Exception as e:
+            logger.error(f"[TRANSACTION-ERROR] Krytyczny błąd wysyłania zlecenia {side} dla {symbol}: {e}")
             return None
 
 # =========================================================================
-# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE V6.5 PRO)
+# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE V7.0 PRO)
 # =========================================================================
 async def run_async_pipeline():
     global RATE_LIMITER, PIPELINE_LOCK
     if PIPELINE_LOCK is None: 
         PIPELINE_LOCK = asyncio.Lock()
     if PIPELINE_LOCK.locked(): 
+        logger.debug("[POTOK-WARN] Poprzednia pętla analizy wciąż trwa. Blokuję nakładanie wątków.")
         return
     
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [POTOK V6.5] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
+        logger.info("🕵️ [POTOK V7.0] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
         if RATE_LIMITER is None: 
             RATE_LIMITER = TokenBucketRateLimiter()
         
@@ -307,7 +325,7 @@ async def run_async_pipeline():
             binance = BinanceTestnetClient(session, RATE_LIMITER)
             total_balance = await binance.get_account_balance()
             
-            # ROZSZERZONY RADAR: BTC, ETH, SOL, BNB, LINK, XRP (Precyzyjnie dostosowane min_qty i round_digits)
+            # PEŁNY RADAR WALUTOWY V7.0
             instruments = [
                 {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5},
                 {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4},
@@ -327,7 +345,6 @@ async def run_async_pipeline():
                     await redis_trade.push_historical_tick(inst["label"], ticker, max_elements=50)
                     history = await redis_trade.get_historical_ticks(inst["label"], max_elements=50)
                     
-                    # Wywołanie rozbudowanego rdzenia Quant
                     metrics = AlgorithmicQuantCore.calculate_z_score(history)
                     if metrics:
                         z = metrics["z_score"]
@@ -340,30 +357,37 @@ async def run_async_pipeline():
                         logger.info(f"📊 [{inst['label']}] P: {current_price} | Z: {z} | RSI: {rsi} | Bw: {bandwidth} | T: {trend}")
                         await redis_trade.incr_metric(f"ticks_{inst['label']}")
                         
-                        # 3. ZMIENNOŚĆ: Filtr Bollinger BandWidth (Blokada przed fałszywym wybiciem w ścisku)
+                        # Tryb Debugowania Bramki Decyzyjnej
+                        logger.debug(
+                            f"[DECISION-TREE-{inst['label']}] Ocena filtrów: "
+                            f"Z-Score ok? {abs(z) >= 2.0} (Wartość: {z}) | "
+                            f"RSI Kupno? {rsi <= 35} / Sprzedaż? {rsi >= 65} (Wartość: {rsi}) | "
+                            f"Trend zgodny? {trend}"
+                        )
+                        
+                        # 3. ZMIENNOŚĆ: Filtr Bollinger BandWidth
                         if bandwidth < 0.001:
                             logger.info(f"⚠️ [{inst['label']}] Blokada strategii: Skrajnie niski BandWidth ({bandwidth}). Rynek w fazie ścisku.")
                             continue
 
-                        # 4. MATEMATYKA PORTFELA (Position Sizing - Ryzyko 1% kapitału oparte na dynamicznym ATR)
-                        risk_capital = total_balance * 0.01  # Dokładnie 1% konta
-                        stop_loss_distance = atr * 2         # Odległość SL = 2 * ATR
+                        # 4. MATEMATYKA PORTFELA
+                        risk_capital = total_balance * 0.01  
+                        stop_loss_distance = atr * 2         
                         
                         if stop_loss_distance > 0:
                             calculated_qty = risk_capital / stop_loss_distance
-                            # Zaokrąglenie wielkości pozycji do dopuszczalnych kroków giełdowych określonej monety
                             calculated_qty = max(inst["min_qty"], round(calculated_qty, inst["round_digits"]))
                         else:
                             calculated_qty = inst["min_qty"]
 
-                        # --- ARCHITEKTURA DECYZJI STRATEGICZNEJ NA PODSTAWIE EMY, RSI ORAZ Z-SCORE ---
+                        # --- ARCHITEKTURA DECYZJI STRATEGICZNEJ ---
                         if z <= -2.0 and trend == "LONG_ONLY" and rsi <= 35:
-                            # 🟩 ZGODA NA KUPNO (Trend wzrostowy + Wyprzedanie RSI + Statystyczny dołek Z-Score)
+                            logger.debug(f"[EXECUTION-TRIGGER] Wszystkie warunki LONG spełnione dla {inst['label']}. Wysyłam zlecenie BUY.")
                             order_res = await binance.execute_market_order(inst["symbol"], "BUY", calculated_qty)
                             if order_res and order_res.get("status") == "FILLED":
-                                take_profit = current_price + (stop_loss_distance * 1.5) # R:R Ratio przynajmniej 1.5
+                                take_profit = current_price + (stop_loss_distance * 1.5)
                                 await tg.push(
-                                    f"🟩 <b>[TRADING SYSTEM V6.5: ORDER FILLED]</b>\n"
+                                    f"🟩 <b>[TRADING SYSTEM V7.0: ORDER FILLED]</b>\n"
                                     f"──────────────────────────────\n"
                                     f"🤖 Pozycja: <b>LONG (Kupno SPOT)</b>\n"
                                     f"📈 Instrument: <b>{inst['label']}</b>\n"
@@ -371,8 +395,8 @@ async def run_async_pipeline():
                                     f"📦 Wielkość pozycji: <b>{calculated_qty}</b> (Zaryzykowano 1% konta)\n"
                                     f"──────────────────────────────\n"
                                     f"📊 <b>PARAMETRY MATEMATYCZNE:</b>\n"
-                                    f"  • Z-Score: <code>{z}</code> (Skrajne odchylenie)\n"
-                                    f"  • RSI (14): <code>{rsi}</code> (Potwierdzone wyprzedanie)\n"
+                                    f"  • Z-Score: <code>{z}</code>\n"
+                                    f"  • RSI (14): <code>{rsi}</code>\n"
                                     f"  • Trend (EMA): <code>{trend}</code>\n"
                                     f"  • Zmienność (ATR): <code>{round(atr, 6)}</code>\n"
                                     f"──────────────────────────────\n"
@@ -382,14 +406,14 @@ async def run_async_pipeline():
                                     f"──────────────────────────────\n"
                                     f"<i>Wiadomość wygenerowana automatycznie przez silnik na Renderze.</i>"
                                 )
-
+                        
                         elif z >= 2.0 and trend == "SHORT_ONLY" and rsi >= 65:
-                            # 🟥 ZGODA NA SPRZEDAŻ (Trend spadkowy + Wykupienie RSI + Statystyczna górka Z-Score)
+                            logger.debug(f"[EXECUTION-TRIGGER] Wszystkie warunki SHORT spełnione dla {inst['label']}. Wysyłam zlecenie SELL.")
                             order_res = await binance.execute_market_order(inst["symbol"], "SELL", calculated_qty)
                             if order_res and order_res.get("status") == "FILLED":
                                 take_profit = current_price - (stop_loss_distance * 1.5)
                                 await tg.push(
-                                    f"🟥 <b>[TRADING SYSTEM V6.5: ORDER FILLED]</b>\n"
+                                    f"🟥 <b>[TRADING SYSTEM V7.0: ORDER FILLED]</b>\n"
                                     f"──────────────────────────────\n"
                                     f"🤖 Pozycja: <b>SHORT (Sprzedaż SPOT)</b>\n"
                                     f"📈 Instrument: <b>{inst['label']}</b>\n"
@@ -397,8 +421,8 @@ async def run_async_pipeline():
                                     f"📦 Wielkość pozycji: <b>{calculated_qty}</b> (Zaryzykowano 1% konta)\n"
                                     f"──────────────────────────────\n"
                                     f"📊 <b>PARAMETRY MATEMATYCZNE:</b>\n"
-                                    f"  • Z-Score: <code>{z}</code> (Skrajne odchylenie)\n"
-                                    f"  • RSI (14): <code>{rsi}</code> (Potwierdzone wykupienie)\n"
+                                    f"  • Z-Score: <code>{z}</code>\n"
+                                    f"  • RSI (14): <code>{rsi}</code>\n"
                                     f"  • Trend (EMA): <code>{trend}</code>\n"
                                     f"  • Zmienność (ATR): <code>{round(atr, 6)}</code>\n"
                                     f"──────────────────────────────\n"
