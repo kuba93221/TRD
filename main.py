@@ -307,9 +307,14 @@ async def run_async_pipeline():
             binance = BinanceTestnetClient(session, RATE_LIMITER)
             total_balance = await binance.get_account_balance()
             
+            # ROZSZERZONY RADAR: BTC, ETH, SOL, BNB, LINK, XRP (Precyzyjnie dostosowane min_qty i round_digits)
             instruments = [
-                {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT", "min_qty": 0.00001},
-                {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT", "min_qty": 0.0001}
+                {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5},
+                {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4},
+                {"client": binance, "symbol": "SOLUSDT", "label": "SOL_USDT", "min_qty": 0.01, "round_digits": 2},
+                {"client": binance, "symbol": "BNBUSDT", "label": "BNB_USDT", "min_qty": 0.001, "round_digits": 3},
+                {"client": binance, "symbol": "LINKUSDT", "label": "LINK_USDT", "min_qty": 0.01, "round_digits": 2},
+                {"client": binance, "symbol": "XRPUSDT", "label": "XRP_USDT", "min_qty": 0.1, "round_digits": 1}
             ]
             
             for inst in instruments:
@@ -346,8 +351,8 @@ async def run_async_pipeline():
                         
                         if stop_loss_distance > 0:
                             calculated_qty = risk_capital / stop_loss_distance
-                            # Zaokrąglenie wielkości pozycji do dopuszczalnych kroków giełdowych
-                            calculated_qty = max(inst["min_qty"], round(calculated_qty, 5))
+                            # Zaokrąglenie wielkości pozycji do dopuszczalnych kroków giełdowych określonej monety
+                            calculated_qty = max(inst["min_qty"], round(calculated_qty, inst["round_digits"]))
                         else:
                             calculated_qty = inst["min_qty"]
 
@@ -358,11 +363,24 @@ async def run_async_pipeline():
                             if order_res and order_res.get("status") == "FILLED":
                                 take_profit = current_price + (stop_loss_distance * 1.5) # R:R Ratio przynajmniej 1.5
                                 await tg.push(
-                                    f"🟩 <b>[ORDER FILLED - LONG]</b>\nRynek: <b>{inst['label']}</b>\n"
-                                    f"Z-Score: <b>{z}</b> | RSI: <b>{rsi}</b>\n"
-                                    f"Ilość: <b>{calculated_qty}</b>\n"
-                                    f"Dynamiczny SL (ATR): <b>{round(current_price - stop_loss_distance, 2)} USDT</b>\n"
-                                    f"Dynamiczny TP (R:R 1.5): <b>{round(take_profit, 2)} USDT</b>"
+                                    f"🟩 <b>[TRADING SYSTEM V6.5: ORDER FILLED]</b>\n"
+                                    f"──────────────────────────────\n"
+                                    f"🤖 Pozycja: <b>LONG (Kupno SPOT)</b>\n"
+                                    f"📈 Instrument: <b>{inst['label']}</b>\n"
+                                    f"💰 Cena wejścia: <b>{current_price} USDT</b>\n"
+                                    f"📦 Wielkość pozycji: <b>{calculated_qty}</b> (Zaryzykowano 1% konta)\n"
+                                    f"──────────────────────────────\n"
+                                    f"📊 <b>PARAMETRY MATEMATYCZNE:</b>\n"
+                                    f"  • Z-Score: <code>{z}</code> (Skrajne odchylenie)\n"
+                                    f"  • RSI (14): <code>{rsi}</code> (Potwierdzone wyprzedanie)\n"
+                                    f"  • Trend (EMA): <code>{trend}</code>\n"
+                                    f"  • Zmienność (ATR): <code>{round(atr, 6)}</code>\n"
+                                    f"──────────────────────────────\n"
+                                    f"🛡️ <b>ZARZĄDZANIE RYZYKIEM (R:R 1:1.5):</b>\n"
+                                    f"  • 🛑 <b>STOP LOSS:</b> <code>{round(current_price - stop_loss_distance, 4)} USDT</code>\n"
+                                    f"  • 🎯 <b>TAKE PROFIT:</b> <code>{round(take_profit, 4)} USDT</code>\n"
+                                    f"──────────────────────────────\n"
+                                    f"<i>Wiadomość wygenerowana automatycznie przez silnik na Renderze.</i>"
                                 )
 
                         elif z >= 2.0 and trend == "SHORT_ONLY" and rsi >= 65:
@@ -371,11 +389,24 @@ async def run_async_pipeline():
                             if order_res and order_res.get("status") == "FILLED":
                                 take_profit = current_price - (stop_loss_distance * 1.5)
                                 await tg.push(
-                                    f"🟥 <b>[ORDER FILLED - SHORT]</b>\nRynek: <b>{inst['label']}</b>\n"
-                                    f"Z-Score: <b>{z}</b> | RSI: <b>{rsi}</b>\n"
-                                    f"Ilość: <b>{calculated_qty}</b>\n"
-                                    f"Dynamiczny SL (ATR): <b>{round(current_price + stop_loss_distance, 2)} USDT</b>\n"
-                                    f"Dynamiczny TP (R:R 1.5): <b>{round(take_profit, 2)} USDT</b>"
+                                    f"🟥 <b>[TRADING SYSTEM V6.5: ORDER FILLED]</b>\n"
+                                    f"──────────────────────────────\n"
+                                    f"🤖 Pozycja: <b>SHORT (Sprzedaż SPOT)</b>\n"
+                                    f"📈 Instrument: <b>{inst['label']}</b>\n"
+                                    f"💰 Cena wejścia: <b>{current_price} USDT</b>\n"
+                                    f"📦 Wielkość pozycji: <b>{calculated_qty}</b> (Zaryzykowano 1% konta)\n"
+                                    f"──────────────────────────────\n"
+                                    f"📊 <b>PARAMETRY MATEMATYCZNE:</b>\n"
+                                    f"  • Z-Score: <code>{z}</code> (Skrajne odchylenie)\n"
+                                    f"  • RSI (14): <code>{rsi}</code> (Potwierdzone wykupienie)\n"
+                                    f"  • Trend (EMA): <code>{trend}</code>\n"
+                                    f"  • Zmienność (ATR): <code>{round(atr, 6)}</code>\n"
+                                    f"──────────────────────────────\n"
+                                    f"🛡️ <b>ZARZĄDZANIE RYZYKIEM (R:R 1:1.5):</b>\n"
+                                    f"  • 🛑 <b>STOP LOSS:</b> <code>{round(current_price + stop_loss_distance, 4)} USDT</code>\n"
+                                    f"  • 🎯 <b>TAKE PROFIT:</b> <code>{round(take_profit, 4)} USDT</code>\n"
+                                    f"──────────────────────────────\n"
+                                    f"<i>Wiadomość wygenerowana automatycznie przez silnik na Renderze.</i>"
                                 )
             
             gc.collect()
