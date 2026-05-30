@@ -74,7 +74,7 @@ class TokenBucketRateLimiter:
                 self.tokens -= 1.0
 
 # =========================================================================
-# POMOST UPSTASH REDIS (ZOPTYMALIZOWANY PIPELINE Z PEŁNĄ KOMPATYBILNOŚCIĄ)
+# POMOST UPSTASH REDIS (KOREKTA PARSOWANIA PIPELINE + POPRAWKA UTC 2026)
 # =========================================================================
 class UpstashRedisTradingBridge:
     def __init__(self, url: str, token: str, session: aiohttp.ClientSession):
@@ -85,24 +85,18 @@ class UpstashRedisTradingBridge:
         } if token else {}
         self.session = session
         self.prefix = "TRADE_"
-        # Bezpieczny wewnętrzny schowek na dane (Marta "LeakHunter")
         self._pipeline_cache = {}
 
     def _enforce_prefix(self, key: str) -> str:
         return key if key.startswith(self.prefix) else f"{self.prefix}{key}"
 
     async def push_historical_tick(self, market_id: str, tick_data: Dict[str, Any], max_elements: int = 50) -> bool:
-        """
-        Kompatybilne wejście: Wykonuje atomowy pipeline (LPUSH + LTRIM + LRANGE) w jednym zapytaniu
-        i zapisuje wynik w pamięci lokalnej na potrzeby natychmiastowego odczytu.
-        """
+        """Wpycha cenę i pobiera historię przez Upstash Pipeline z poprawnym parsowaniem listy."""
         if not self.url: return False
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
             hex_str = msgpack.packb(tick_data, use_bin_type=True).hex()
-            logger.debug(f"[REDIS-OPTIMIZED-PIPELINE] Wykonywanie zbiorczego pakietu dla {safe_key}")
             
-            # Budowa paczki poleceń do endpointu /pipeline
             pipeline_payload = [
                 ["LPUSH", safe_key, hex_str],
                 ["LTRIM", safe_key, "0", str(max_elements - 1)],
@@ -114,12 +108,13 @@ class UpstashRedisTradingBridge:
                 if resp.status != 200: 
                     return False
                 
-                response_data = await resp.json()
-                results = response_data.get("result", [])
+                # Upstash zwraca bezpośrednio LISTĘ wyników dla każdego polecenia w pipeline
+                results = await resp.json()
                 
-                if len(results) >= 3:
-                    # Wynik LRANGE (trzecie polecenie) parsujemy i odkładamy do szybkiej pamięci podręcznej
+                if isinstance(results, list) and len(results) >= 3:
+                    # Rezultatem trzeciego polecenia (LRANGE) jest lista spakowanych HEX-ów
                     hex_list = results[2]
+                    
                     self._pipeline_cache[market_id] = [
                         msgpack.unpackb(bytes.fromhex(h), strict_map_key=False) 
                         for h in hex_list if h and h not in ["None", "NULL"]
@@ -131,24 +126,20 @@ class UpstashRedisTradingBridge:
             return False
 
     async def get_historical_ticks(self, market_id: str, max_elements: int = 50) -> List[Dict[str, Any]]:
-        """
-        Kompatybilne wyjście: Pobiera dane z pamięci podręcznej wypełnionej ułamek sekundy wcześniej 
-        przez push_historical_tick. ZERO dodatkowych zapytań sieciowych!
-        """
-        # Pobieranie danych z pamięci RAM kontenera zamiast wysyłania kolejnego żądania HTTP GET
+        """Zwraca dane z bufora RAM. W przypadku błędu aktywuje bezpieczny fallback."""
         cached_data = self._pipeline_cache.pop(market_id, None)
         if cached_data is not None:
-            logger.debug(f"[REDIS-CACHE-HIT] Zwracanie serii danych z pamięci dla {market_id} (Oszczędność I/O)")
+            logger.debug(f"[REDIS-CACHE] Pobrano serię historyczną {market_id} z pamięci podręcznej (Oszczędność I/O)")
             return cached_data
             
-        # Awaryjny fallback na wypadek, gdyby kolejność w głównym skrypcie została zmieniona
         if not self.url: return []
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
             url = f"{self.url}/lrange/{safe_key}/0/{max_elements - 1}"
             async with self.session.get(url, headers=self.headers, timeout=4) as response:
                 if response.status != 200: return []
-                hex_list = (await response.json()).get("result", [])
+                res_json = await response.json()
+                hex_list = res_json.get("result", []) if isinstance(res_json, dict) else []
                 return [msgpack.unpackb(bytes.fromhex(h), strict_map_key=False) for h in hex_list if h and h not in ["None", "NULL"]]
         except Exception as e:
             logger.error(f"❌ [REDIS FALLBACK ERROR] {market_id}: {e}")
@@ -156,9 +147,10 @@ class UpstashRedisTradingBridge:
 
     async def incr_metric(self, field_name: str):
         if not self.url: return
-        key = self._enforce_prefix(f"ANALYTICS:{field_name}:{datetime.utcnow().strftime('%Y-%m-%d')}")
+        # Zgodność z Python 3.11+: Zastąpienie deprecated utcnow() bezpiecznym standardem strefowym
+        current_date = datetime.now(datetime.UTC).strftime('%Y-%m-%d')
+        key = self._enforce_prefix(f"ANALYTICS:{field_name}:{current_date}")
         try:
-            # Używamy sesji z zaktualizowanym nagłówkiem autoryzacji
             async with self.session.get(f"{self.url}/incr/{key}", headers=self.headers, timeout=3) as resp: 
                 await resp.read()
         except Exception: 
