@@ -25,9 +25,9 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO), 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Algorithmic_Trading_Engine_v5.1_PRODUCTION")
+logger = logging.getLogger("Algorithmic_Trading_Engine_v9.0_PRODUCTION")
 
-logger.info("⚙️ [SYSTEM-INIT] Uruchamianie CAŁOŚCIOWEGO silnika [Binance PURE SPOT Core v5.1]")
+logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO silnika v9.0 [Binance OCO PURE SPOT]")
 
 BACKGROUND_LOOP = None
 PIPELINE_LOCK = None  
@@ -117,7 +117,6 @@ class UpstashRedisTradingBridge:
                     return False
                 
                 results = await resp.json()
-                
                 if isinstance(results, list) and len(results) >= 3:
                     cmd_res = results[2]
                     hex_list = cmd_res.get("result", []) if isinstance(cmd_res, dict) else []
@@ -190,7 +189,7 @@ class TelegramThrottledDispatcher:
             pass
 
 # =========================================================================
-# RDZEŃ QUANT: Z-SCORE + FILTRY TRENDU, MOMENTUM, WOLUMENU I RYZYKA
+# RDZEŃ QUANT: Z-SCORE + FILTRY TRENDU MACRO 1H, MOMENTUM I RYZYKA
 # =========================================================================
 class AlgorithmicQuantCore:
     """Aparat matematyczny kasowego powrotu do średniej opartego na SPOT."""
@@ -218,11 +217,10 @@ class AlgorithmicQuantCore:
         return 100.0 - (100.0 / (1.0 + rs))
 
     @staticmethod
-    def calculate_z_score(ticks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def calculate_z_score(ticks: List[Dict[str, Any]], macro_prices: List[float]) -> Optional[Dict[str, Any]]:
         prices = [float(t.get("last", 0)) for t in ticks if t.get("last")]
         n = len(prices)
         if n < 20: 
-            logger.debug(f"[QUANT-DEBUG] Niewystarczająca próba danych: {n}/20 próbek. Pomijam kalkulację.")
             return None  
 
         sma = sum(prices) / n
@@ -232,9 +230,14 @@ class AlgorithmicQuantCore:
         current_price = prices[0]
         z_score = (current_price - sma) / std_dev
 
-        ema_trend = AlgorithmicQuantCore._calculate_ema(prices, period=15)
+        # Wyliczanie filtrów EMA i RSI z prawdziwych świec makro (1H bezpośrednio z giełdy)
+        use_prices = macro_prices if len(macro_prices) >= 15 else prices
+        ema_trend = AlgorithmicQuantCore._calculate_ema(use_prices, period=15)
         trend_direction = "LONG_ONLY" if current_price >= ema_trend else "SHORT_ONLY"
-        rsi_val = AlgorithmicQuantCore._calculate_rsi(prices, period=14)
+        
+        use_rsi_prices = macro_prices if len(macro_prices) >= 15 else prices
+        rsi_val = AlgorithmicQuantCore._calculate_rsi(use_rsi_prices, period=14)
+        
         bandwidth = (std_dev * 4) / sma if sma != 0 else 0.0
         atr_estimated = std_dev * 0.5
 
@@ -249,7 +252,7 @@ class AlgorithmicQuantCore:
         }
 
 # =========================================================================
-# SYSTEMOWY KLIENT BINANCE SPOT (PEŁNA ŚWIADOMOŚĆ STANU KONTA)
+# SYSTEMOWY KLIENT BINANCE SPOT (PEŁNA STRUKTURA OCO I ŚWIEC MAKRO)
 # =========================================================================
 class BinanceSpotClient:
     def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter):
@@ -263,7 +266,6 @@ class BinanceSpotClient:
         return hmac.new(self.secret_key.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
     async def get_account_balance(self) -> float:
-        """Pobiera wolne saldo konta w czasie rzeczywistym na potrzeby Position Sizingu."""
         if not self.api_key or not self.secret_key: 
             return 10000.0  
         await self.rate_limiter.consume()
@@ -289,12 +291,25 @@ class BinanceSpotClient:
         try:
             url = f"{self.base_url}/ticker/price?symbol={symbol}"
             async with self.session.get(url, timeout=5) as response:
-                if response.status != 200: 
-                    return None
+                if response.status != 200: return None
                 data = await response.json()
                 return {"source": "BINANCE_SPOT", "symbol": symbol, "last": float(data.get("price", 0))}
-        except Exception as e:
+        except Exception:
             return None
+
+    async def get_macro_candles(self, symbol: str, interval: str = "1h", limit: int = 30) -> List[float]:
+        """Pobiera historyczne świece z Binance, aby wyznaczyć prawdziwy trend makro."""
+        await self.rate_limiter.consume()
+        url = f"{self.base_url}/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        try:
+            async with self.session.get(url, timeout=5) as response:
+                if response.status != 200: return []
+                data = await response.json()
+                # Indeks 4 to cena zamknięcia (Close Price) w strukturze klines Binance
+                return [float(candle[4]) for candle in data]
+        except Exception as e:
+            logger.error(f"[BINANCE-CANDLES-ERROR] Błąd pobierania świec makro dla {symbol}: {e}")
+            return []
 
     async def execute_market_order(self, symbol: str, side: str, quantity: float) -> Optional[Dict[str, Any]]:
         if not self.api_key or not self.secret_key: return None
@@ -318,8 +333,37 @@ class BinanceSpotClient:
             logger.error(f"[TRANSACTION-ERROR] Krytyczny błąd zlecenia {side} dla {symbol}: {e}")
             return None
 
+    async def execute_oco_protection(self, symbol: str, quantity: float, price_tp: float, price_sl: float) -> Optional[Dict[str, Any]]:
+        """Wysyła zautomatyzowane, podwójne zlecenie obronne OCO na serwery Binance SPOT."""
+        if not self.api_key or not self.secret_key: return None
+        await self.rate_limiter.consume()
+        timestamp = int(time.time() * 1000)
+        
+        params = {
+            "symbol": symbol,
+            "side": "SELL",
+            "quantity": quantity,
+            "price": price_tp,          # Poziom realizacji zysku (Limit Take Profit)
+            "stopPrice": price_sl,      # Poziom wyzwolenia cięcia strat (Stop Trigger)
+            "stopLimitPrice": price_sl, # Poziom egzekucji cięcia strat (Stop Limit)
+            "timestamp": timestamp
+        }
+        
+        query_string = urlencode(params)
+        signature = self._generate_signature(query_string)
+        url = f"{self.base_url}/order/oco?{query_string}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        try:
+            async with self.session.post(url, headers=headers, timeout=5) as r:
+                res = await r.json()
+                logger.info(f"🛡️ [OCO-DEPLOYED] Automatyczna ochrona OCO wysłana na Binance dla {symbol}: {res}")
+                return res
+        except Exception as e:
+            logger.error(f"❌ [OCO-CRITICAL-ERROR] Awaria wysyłania zlecenia obronnego OCO dla {symbol}: {e}")
+            return None
+
 # =========================================================================
-# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (BRAMKA DWUTOROWA v5.1)
+# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (BRAMKA v9.0 OCO PRO)
 # =========================================================================
 async def run_async_pipeline():
     global RATE_LIMITER, PIPELINE_LOCK
@@ -330,7 +374,7 @@ async def run_async_pipeline():
         return
     
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [POTOK V5.1] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
+        logger.info("🕵️ [POTOK V9.0] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
         if RATE_LIMITER is None: 
             RATE_LIMITER = TokenBucketRateLimiter()
         
@@ -347,17 +391,15 @@ async def run_async_pipeline():
             )
             
             binance = BinanceSpotClient(session, RATE_LIMITER)
-            
-            # 1. BOT SPRAWDZA STAN KONTA (Zna stan kapitału do Position Sizingu)
             total_balance = await binance.get_account_balance()
             
             instruments = [
-                {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5},
-                {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4},
-                {"client": binance, "symbol": "SOLUSDT", "label": "SOL_USDT", "min_qty": 0.01, "round_digits": 2},
-                {"client": binance, "symbol": "BNBUSDT", "label": "BNB_USDT", "min_qty": 0.001, "round_digits": 3},
-                {"client": binance, "symbol": "LINKUSDT", "label": "LINK_USDT", "min_qty": 0.01, "round_digits": 2},
-                {"client": binance, "symbol": "XRPUSDT", "label": "XRP_USDT", "min_qty": 0.1, "round_digits": 1}
+                {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
+                {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
+                {"client": binance, "symbol": "SOLUSDT", "label": "SOL_USDT", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
+                {"client": binance, "symbol": "BNBUSDT", "label": "BNB_USDT", "min_qty": 0.001, "round_digits": 3, "price_round": 1},
+                {"client": binance, "symbol": "LINKUSDT", "label": "LINK_USDT", "min_qty": 0.01, "round_digits": 2, "price_round": 3},
+                {"client": binance, "symbol": "XRPUSDT", "label": "XRP_USDT", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
             ]
             
             for inst in instruments:
@@ -370,7 +412,10 @@ async def run_async_pipeline():
                     await redis_trade.push_historical_tick(inst["label"], ticker, max_elements=50)
                     history = await redis_trade.get_historical_ticks(inst["label"], max_elements=50)
                     
-                    metrics = AlgorithmicQuantCore.calculate_z_score(history)
+                    # Pobieranie świec 1-godzinnych bezpośrednio z Binance do wyznaczenia trendu makro
+                    macro_candles = await inst["client"].get_macro_candles(inst["symbol"], interval="1h", limit=30)
+                    
+                    metrics = AlgorithmicQuantCore.calculate_z_score(history, macro_candles)
                     if metrics:
                         z = metrics["z_score"]
                         rsi = metrics["rsi"]
@@ -383,17 +428,17 @@ async def run_async_pipeline():
                         await redis_trade.incr_metric(f"ticks_{inst['label']}")
                         
                         logger.debug(
-                            f"[DECISION-TREE-{inst['label']}] Ocena filtrów SPOT (Tylko Kupno): "
-                            f"Z-Score ok? {z <= -1.5} (Wartość: {z}) | "
-                            f"RSI Kupno ok? {rsi <= 35} (Wartość: {rsi}) | "
-                            f"Trend wzrostowy ok? {trend == 'LONG_ONLY'} (Wartość: {trend})"
+                            f"[DECISION-TREE-{inst['label']}] Ocena filtrów SPOT: "
+                            f"Z-Score Standard ok? {z <= -1.5} | Z-Score Crash ok? {z <= -2.5} (Wartość: {z}) | "
+                            f"RSI 1H ok? {rsi <= 35} | RSI Crash ok? {rsi <= 20} (Wartość: {rsi}) | "
+                            f"Trend Makro 1H ok? {trend == 'LONG_ONLY'} (Wartość: {trend})"
                         )
                         
                         if bandwidth < 0.001:
                             logger.info(f"⚠️ [{inst['label']}] Blokada strategii: Skrajnie niski BandWidth ({bandwidth}). Rynek w fazie ścisku.")
                             continue
 
-                        # 2. BOT WIE ZA ILE OTWORZYĆ POZYCJĘ (Zawsze 1% ryzyka kapitału konta)
+                        # 2. ZARZĄDZANIE RYZYKIEM (Position Sizing - Ryzyko 1% kapitału konta)
                         risk_capital = total_balance * 0.01  
                         stop_loss_distance = atr * 2         
                         
@@ -409,26 +454,35 @@ async def run_async_pipeline():
                             calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
                             calculated_qty = max(inst["min_qty"], calculated_qty)
 
-                        # --- ROZWIĄZANIE PARADOKSU: DWUTOROWA BRAMKA DECYZYJNA R&D ---
+                        # --- DWUTOROWA BRAMKA DECYZYJNA ---
                         standard_buy = (z <= -1.5 and trend == "LONG_ONLY" and rsi <= 35)
-                        crash_buy = (z <= -2.5 and rsi <= 20)  # Pancerna ścieżka łapania krachów
+                        crash_buy = (z <= -2.5 and rsi <= 20)
                         
                         if standard_buy or crash_buy:
                             logger.info(f"🚨 [EXECUTION-TRIGGER] Wyzwolenie zakupu SPOT dla {inst['label']}. (Standard: {standard_buy}, Crash: {crash_buy})")
                             order_res = await inst["client"].execute_market_order(inst["symbol"], "BUY", calculated_qty)
                             
                             if order_res and order_res.get("status") == "FILLED":
-                                take_profit = current_price + (stop_loss_distance * 1.5)
+                                # Precyzyjne wyliczenie poziomów cenowych dla zleceń OCO
+                                actual_qty = float(order_res.get("executedQty", calculated_qty))
+                                price_tp = round(current_price + (stop_loss_distance * 1.5), inst["price_round"])
+                                price_sl = round(current_price - stop_loss_distance, inst["price_round"])
+                                
+                                # Natychmiastowe wysłanie zautomatyzowanej ochrony OCO na serwery Binance
+                                await asyncio.sleep(0.2) # Mały bufor dla rozliczenia silnika SPOT
+                                await inst["client"].execute_oco_protection(inst["symbol"], actual_qty, price_tp, price_sl)
+                                
                                 await tg.push(
-                                    f"🟩 <b>[TRADING SYSTEM v5.1: ORDER FILLED]</b>\n"
+                                    f"🟩 <b>[TRADING SYSTEM v9.0: DEPLOYED WITH OCO]</b>\n"
                                     f"──────────────────────────────\n"
-                                    f"🤖 Strategia: <b>Mean Reversion (Pure SPOT)</b>\n"
+                                    f"🤖 Strategia: <b>Mean Reversion (Pure SPOT v9.0)</b>\n"
                                     f"📈 Instrument: <b>{inst['label']}</b>\n"
                                     f"💰 Cena wejścia: <b>{current_price} USDT</b>\n"
-                                    f"📦 Wielkość pozycji: <b>{calculated_qty}</b> (Podział 1% ryzyka konta)\n"
+                                    f"📦 Wielkość pozycji: <b>{actual_qty}</b> (Zaryzykowano 1% konta)\n"
                                     f"──────────────────────────────\n"
-                                    f"🛡️ STOP LOSS: <code>{round(current_price - stop_loss_distance, 4)} USDT</code>\n"
-                                    f"🎯 TAKE PROFIT: <code>{round(take_profit, 4)} USDT</code>\n"
+                                    f"🛡️ <b>AKTYWNA OCHRONA OCO NA BINANCE:</b>\n"
+                                    f"  • 🎯 TAKE PROFIT: <code>{price_tp} USDT</code>\n"
+                                    f"  • 🛑 STOP LOSS (Tnie 1% konta): <code>{price_sl} USDT</code>\n"
                                     f"──────────────────────────────"
                                 )
             gc.collect()
@@ -438,7 +492,7 @@ async def run_async_pipeline():
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT
-    logger.info("⚡ [TRADING ONLINE] Silnik gotowy na wyzwalanie zewnętrzne przez endpoint.")
+    logger.info("⚡ [TRADING ONLINE] Silnik OCO gotowy na wyzwalanie zewnętrzne przez endpoint.")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         await asyncio.sleep(1)
