@@ -426,24 +426,14 @@ async def run_async_pipeline():
             gc.collect()
 
 # =========================================================================
-# ASYNCHRONICZNY CRON I WĄTEK SPOCZYNKOWY
+# NAPRAWIONY ASYNCHRONICZNY CRON (BEZ KONFLIKTU WĄTKÓW)
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT
     logger.info("⚡ [TRADING ONLINE] Silnik gotowy na wyzwalanie zewnętrzne przez endpoint.")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
     
-    # Rejestracja obsługi bezpiecznego wyłączania (Graceful Shutdown)
-    def stop_handler():
-        logger.warning("🛑 [SIGTERM/SIGINT] Przechwycono sygnał zamknięcia kontenera Render. Kończenie pracy...")
-        ASYNC_SHUTDOWN_EVENT.set()
-    
-    try:
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, stop_handler)
-    except NotImplementedError:
-        pass # Zabezpieczenie dla środowisk developerskich Windows
-        
+    # Pętla oczekiwania - sygnały są teraz bezpiecznie obsługiwane przez wątek główny
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         await asyncio.sleep(1)
     
@@ -500,7 +490,27 @@ def export_analytics_safe_json():
     except Exception as e: 
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# =========================================================================
+# INICJACJA I BEZPIECZNA OBSŁUGA SYGNAŁÓW W WĄTKU GŁÓWNYM (MAIN THREAD)
+# =========================================================================
 if __name__ == "__main__":
+    # 1. Uruchomienie asynchronicznego tradingu w tle
     worker_thread = threading.Thread(target=background_scheduler_thread, daemon=True)
     worker_thread.start()
+    
+    # 2. Pancerny system przechwytywania sygnałów w głównym interpreterze (Marta Spec)
+    def main_thread_shutdown_handler(signum, frame):
+        logger.warning(f"🛑 [SIGTERM/SIGINT] Przechwycono sygnał {signum} w wątku głównym. Wyłączanie bota...")
+        if BACKGROUND_LOOP and ASYNC_SHUTDOWN_EVENT:
+            BACKGROUND_LOOP.call_soon_threadsafe(ASYNC_SHUTDOWN_EVENT.set)
+        # Krótka zwłoka na wyczyszczenie potoków sieciowych
+        time.sleep(1.5)
+        sys.exit(0)
+
+    # Rejestracja systemowa w Main Thread
+    import sys
+    signal.signal(signal.SIGTERM, main_thread_shutdown_handler)
+    signal.signal(signal.SIGINT, main_thread_shutdown_handler)
+
+    # 3. Start serwera Flask (Wątek główny, blokujący)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False)
