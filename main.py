@@ -74,56 +74,91 @@ class TokenBucketRateLimiter:
                 self.tokens -= 1.0
 
 # =========================================================================
-# POMOST UPSTASH REDIS (RYGORYSTYCZNA SEPARACJA PRZESTRZENI 'TRADE_')
+# POMOST UPSTASH REDIS (ZOPTYMALIZOWANY PIPELINE Z PEŁNĄ KOMPATYBILNOŚCIĄ)
 # =========================================================================
 class UpstashRedisTradingBridge:
     def __init__(self, url: str, token: str, session: aiohttp.ClientSession):
         self.url = url.rstrip('/') if url else ""
-        self.headers = {"Authorization": f"Bearer {token}"} if token else {}
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        } if token else {}
         self.session = session
         self.prefix = "TRADE_"
+        # Bezpieczny wewnętrzny schowek na dane (Marta "LeakHunter")
+        self._pipeline_cache = {}
 
     def _enforce_prefix(self, key: str) -> str:
         return key if key.startswith(self.prefix) else f"{self.prefix}{key}"
 
     async def push_historical_tick(self, market_id: str, tick_data: Dict[str, Any], max_elements: int = 50) -> bool:
-        """Wpycha najświeższą cenę do kolejki kołowej Redis (FIFO)."""
+        """
+        Kompatybilne wejście: Wykonuje atomowy pipeline (LPUSH + LTRIM + LRANGE) w jednym zapytaniu
+        i zapisuje wynik w pamięci lokalnej na potrzeby natychmiastowego odczytu.
+        """
         if not self.url: return False
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
             hex_str = msgpack.packb(tick_data, use_bin_type=True).hex()
-            logger.debug(f"[REDIS-DEBUG] Próba wykonania LPUSH dla {safe_key}")
-            async with self.session.get(f"{self.url}/lpush/{safe_key}/{hex_str}", headers=self.headers, timeout=3) as resp:
-                if resp.status != 200: return False
-                await resp.read()
-            async with self.session.get(f"{self.url}/ltrim/{safe_key}/0/{max_elements - 1}", headers=self.headers, timeout=3) as resp:
-                if resp.status == 200:
-                    await resp.read()
+            logger.debug(f"[REDIS-OPTIMIZED-PIPELINE] Wykonywanie zbiorczego pakietu dla {safe_key}")
+            
+            # Budowa paczki poleceń do endpointu /pipeline
+            pipeline_payload = [
+                ["LPUSH", safe_key, hex_str],
+                ["LTRIM", safe_key, "0", str(max_elements - 1)],
+                ["LRANGE", safe_key, "0", str(max_elements - 1)]
+            ]
+            
+            url = f"{self.url}/pipeline"
+            async with self.session.post(url, json=pipeline_payload, headers=self.headers, timeout=5) as resp:
+                if resp.status != 200: 
+                    return False
+                
+                response_data = await resp.json()
+                results = response_data.get("result", [])
+                
+                if len(results) >= 3:
+                    # Wynik LRANGE (trzecie polecenie) parsujemy i odkładamy do szybkiej pamięci podręcznej
+                    hex_list = results[2]
+                    self._pipeline_cache[market_id] = [
+                        msgpack.unpackb(bytes.fromhex(h), strict_map_key=False) 
+                        for h in hex_list if h and h not in ["None", "NULL"]
+                    ]
                     return True
                 return False
         except Exception as e:
-            logger.error(f"❌ [REDIS FIFO ERROR] Błąd kolejki dla {market_id}: {e}")
+            logger.error(f"❌ [REDIS PIPELINE ERROR] Błąd optymalizacji potoku dla {market_id}: {e}")
             return False
 
     async def get_historical_ticks(self, market_id: str, max_elements: int = 50) -> List[Dict[str, Any]]:
-        """Pobiera zmagazynowaną serię czasową próbek cenowych dla wskaźnika Z-Score."""
+        """
+        Kompatybilne wyjście: Pobiera dane z pamięci podręcznej wypełnionej ułamek sekundy wcześniej 
+        przez push_historical_tick. ZERO dodatkowych zapytań sieciowych!
+        """
+        # Pobieranie danych z pamięci RAM kontenera zamiast wysyłania kolejnego żądania HTTP GET
+        cached_data = self._pipeline_cache.pop(market_id, None)
+        if cached_data is not None:
+            logger.debug(f"[REDIS-CACHE-HIT] Zwracanie serii danych z pamięci dla {market_id} (Oszczędność I/O)")
+            return cached_data
+            
+        # Awaryjny fallback na wypadek, gdyby kolejność w głównym skrypcie została zmieniona
         if not self.url: return []
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
             url = f"{self.url}/lrange/{safe_key}/0/{max_elements - 1}"
-            logger.debug(f"[REDIS-DEBUG] Pobieranie serii LRANGE dla {safe_key}")
             async with self.session.get(url, headers=self.headers, timeout=4) as response:
                 if response.status != 200: return []
                 hex_list = (await response.json()).get("result", [])
                 return [msgpack.unpackb(bytes.fromhex(h), strict_map_key=False) for h in hex_list if h and h not in ["None", "NULL"]]
         except Exception as e:
-            logger.error(f"❌ [REDIS LRANGE ERROR] {market_id}: {e}")
+            logger.error(f"❌ [REDIS FALLBACK ERROR] {market_id}: {e}")
             return []
 
     async def incr_metric(self, field_name: str):
         if not self.url: return
         key = self._enforce_prefix(f"ANALYTICS:{field_name}:{datetime.utcnow().strftime('%Y-%m-%d')}")
         try:
+            # Używamy sesji z zaktualizowanym nagłówkiem autoryzacji
             async with self.session.get(f"{self.url}/incr/{key}", headers=self.headers, timeout=3) as resp: 
                 await resp.read()
         except Exception: 
