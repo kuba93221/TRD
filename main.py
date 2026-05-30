@@ -25,9 +25,9 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO), 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Algorithmic_Trading_Engine_v7.0_PRO")
+logger = logging.getLogger("Algorithmic_Trading_Engine_v8.0_PURE_SPOT")
 
-logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota w bezpiecznej gałęzi DEV [Pancerny Rdzeń Binance Only]")
+logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota w bezpiecznej gałęzi DEV [Pancerny Rdzeń Binance PURE SPOT]")
 
 BACKGROUND_LOOP = None
 PIPELINE_LOCK = None  
@@ -152,7 +152,7 @@ class TelegramThrottledDispatcher:
 # RDZEŃ QUANT: Z-SCORE + FILTRY TRENDU, MOMENTUM, WOLUMENU I RYZYKA
 # =========================================================================
 class AlgorithmicQuantCore:
-    """Aparat matematyczny wzbogacony o EMA200, RSI, ATR, BandWidth i Risk Sizing."""
+    """Aparat matematyczny kasowego powrotu do średniej opartego na SPOT."""
     
     @staticmethod
     def _calculate_ema(prices: List[float], period: int = 15) -> float:
@@ -216,12 +216,13 @@ class AlgorithmicQuantCore:
         }
 
 # =========================================================================
-# NOWE MODUŁY POBIERANIA DANYCH RYNKOWYCH V3
+# SYSTEMOWY KLIENT BINANCE SPOT (ELASTYCZNA ARCHITEKTURA TESTNET/LIVE)
 # =========================================================================
-class BinanceTestnetClient:
-    """Pobiera publiczne ceny spot z oficjalnego środowiska testowego Binance."""
+class BinanceSpotClient:
+    """Obsługuje interfejs giełdowy Binance SPOT w środowisku testowym oraz produkcyjnym."""
     def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter):
-        self.base_url = "https://testnet.binance.vision/api/v3"
+        # Pobieranie adresu URL z konfiguracji - ułatwia przesiadkę bez dotykania kodu źródłowego
+        self.base_url = os.environ.get("BINANCE_API_URL", "https://testnet.binance.vision/api/v3").rstrip('/')
         self.session = session
         self.rate_limiter = rate_limiter
         self.api_key = os.environ.get("BINANCE_TESTNET_API_KEY", "")
@@ -231,7 +232,7 @@ class BinanceTestnetClient:
         return hmac.new(self.secret_key.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
     async def get_account_balance(self) -> float:
-        """Pobiera dostępne saldo portfela testowego USDT w celu wyliczenia wielkości pozycji (1% ryzyka)."""
+        """Pobiera dostępne wolne saldo USDT z giełdy SPOT do wyliczenia pozycji."""
         if not self.api_key or not self.secret_key: 
             logger.debug("[BINANCE-DEBUG] Brak zdefiniowanych kluczy API. Zwracam saldo awaryjne 10000 USDT.")
             return 10000.0  
@@ -248,7 +249,7 @@ class BinanceTestnetClient:
                 for b in balances:
                     if b.get("asset") == "USDT": 
                         free_usdt = float(b.get("free", 0))
-                        logger.debug(f"[BINANCE-DEBUG] Pobrane saldo konta testowego: {free_usdt} USDT")
+                        logger.debug(f"[BINANCE-DEBUG] Pobrane saldo konta SPOT: {free_usdt} USDT")
                         return free_usdt
                 return 10000.0
         except Exception as e:
@@ -264,13 +265,13 @@ class BinanceTestnetClient:
                     logger.debug(f"[BINANCE-DEBUG] {symbol} błąd HTTP {response.status}")
                     return None
                 data = await response.json()
-                return {"source": "BINANCE_TESTNET", "symbol": symbol, "last": float(data.get("price", 0))}
+                return {"source": "BINANCE_SPOT", "symbol": symbol, "last": float(data.get("price", 0))}
         except Exception as e:
             logger.debug(f"[BINANCE-DEBUG] Wyjątek połączenia dla {symbol}: {e}")
             return None
 
     async def execute_market_order(self, symbol: str, side: str, quantity: float) -> Optional[Dict[str, Any]]:
-        """Wysyła zlecenie transakcyjne na giełdę."""
+        """Wysyła rygorystyczne zlecenie rynkowe BUY na giełdę SPOT."""
         if not self.api_key or not self.secret_key: return None
         await self.rate_limiter.consume()
         timestamp = int(time.time() * 1000)
@@ -288,14 +289,14 @@ class BinanceTestnetClient:
         try:
             async with self.session.post(url, headers=headers, timeout=5) as r:
                 res_data = await r.json()
-                logger.debug(f"[TRANSACTION-RESPONSE] Odpowiedź silnika Binance: {res_data}")
+                logger.debug(f"[TRANSACTION-RESPONSE] Odpowiedź giełdy SPOT: {res_data}")
                 return res_data
         except Exception as e:
             logger.error(f"[TRANSACTION-ERROR] Krytyczny błąd wysyłania zlecenia {side} dla {symbol}: {e}")
             return None
 
 # =========================================================================
-# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE V7.0 PRO)
+# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE V8.0 PURE SPOT)
 # =========================================================================
 async def run_async_pipeline():
     global RATE_LIMITER, PIPELINE_LOCK
@@ -306,7 +307,7 @@ async def run_async_pipeline():
         return
     
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [POTOK V7.0] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
+        logger.info("🕵️ [POTOK V8.0] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
         if RATE_LIMITER is None: 
             RATE_LIMITER = TokenBucketRateLimiter()
         
@@ -322,10 +323,10 @@ async def run_async_pipeline():
                 session
             )
             
-            binance = BinanceTestnetClient(session, RATE_LIMITER)
+            binance = BinanceSpotClient(session, RATE_LIMITER)
             total_balance = await binance.get_account_balance()
             
-            # PEŁNY RADAR WALUTOWY V7.0
+            # SKANER WALUTOWY SPOT: BTC, ETH, SOL, BNB, LINK, XRP
             instruments = [
                 {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5},
                 {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4},
@@ -357,12 +358,12 @@ async def run_async_pipeline():
                         logger.info(f"📊 [{inst['label']}] P: {current_price} | Z: {z} | RSI: {rsi} | Bw: {bandwidth} | T: {trend}")
                         await redis_trade.incr_metric(f"ticks_{inst['label']}")
                         
-                        # Tryb Debugowania Bramki Decyzyjnej
+                        # TRYB DIAGNOSTYCZNY BRAMKI DECYZYJNEJ (Naprawiono błąd abs(z) -> Sprawdzamy czyste ujemne z_score dla SPOT)
                         logger.debug(
-                            f"[DECISION-TREE-{inst['label']}] Ocena filtrów: "
-                            f"Z-Score ok? {abs(z) >= 2.0} (Wartość: {z}) | "
-                            f"RSI Kupno? {rsi <= 35} / Sprzedaż? {rsi >= 65} (Wartość: {rsi}) | "
-                            f"Trend zgodny? {trend}"
+                            f"[DECISION-TREE-{inst['label']}] Ocena filtrów SPOT (Tylko Kupno): "
+                            f"Z-Score ok? {z <= -2.0} (Wartość: {z}) | "
+                            f"RSI Kupno ok? {rsi <= 35} (Wartość: {rsi}) | "
+                            f"Trend wzrostowy ok? {trend == 'LONG_ONLY'} (Wartość: {trend})"
                         )
                         
                         # 3. ZMIENNOŚĆ: Filtr Bollinger BandWidth
@@ -370,7 +371,7 @@ async def run_async_pipeline():
                             logger.info(f"⚠️ [{inst['label']}] Blokada strategii: Skrajnie niski BandWidth ({bandwidth}). Rynek w fazie ścisku.")
                             continue
 
-                        # 4. MATEMATYKA PORTFELA
+                        # 4. MATEMATYKA PORTFELA (Position Sizing - Ryzyko oparte na stop_loss_distance)
                         risk_capital = total_balance * 0.01  
                         stop_loss_distance = atr * 2         
                         
@@ -380,23 +381,32 @@ async def run_async_pipeline():
                         else:
                             calculated_qty = inst["min_qty"]
 
-                        # --- ARCHITEKTURA DECYZJI STRATEGICZNEJ ---
+                        # FILTR WARUNKU MINIMALNEGO KAPITAŁU (Zabezpieczenie przed odrzuceniem Notional wartości < 10 USDT)
+                        order_value_usdt = calculated_qty * current_price
+                        if order_value_usdt < 11.0:
+                            logger.debug(f"[NOTIONAL-FILTER] Obliczona wartość zlecenia ({round(order_value_usdt, 2)} USDT) poniżej minimum SPOT. Podbijam do progu bezpiecznego.")
+                            calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
+                            # Ponowne sprawdzenie zaokrąglenia wymaganego przez krok minimalny
+                            calculated_qty = max(inst["min_qty"], calculated_qty)
+
+                        # --- RESTRUKTURYZACJA DECYZJI: WYŁĄCZNIE PURE SPOT LONG (KUPNO) ---
                         if z <= -2.0 and trend == "LONG_ONLY" and rsi <= 35:
-                            logger.debug(f"[EXECUTION-TRIGGER] Wszystkie warunki LONG spełnione dla {inst['label']}. Wysyłam zlecenie BUY.")
-                            order_res = await binance.execute_market_order(inst["symbol"], "BUY", calculated_qty)
+                            logger.debug(f"[EXECUTION-TRIGGER] Czysty sygnał SPOT zakupu wyzwolony dla {inst['label']}. Wysyłam zlecenie BUY.")
+                            order_res = await inst["client"].execute_market_order(inst["symbol"], "BUY", calculated_qty)
+                            
                             if order_res and order_res.get("status") == "FILLED":
                                 take_profit = current_price + (stop_loss_distance * 1.5)
                                 await tg.push(
-                                    f"🟩 <b>[TRADING SYSTEM V7.0: ORDER FILLED]</b>\n"
+                                    f"🟩 <b>[TRADING SYSTEM V8.0: ORDER FILLED]</b>\n"
                                     f"──────────────────────────────\n"
-                                    f"🤖 Pozycja: <b>LONG (Kupno SPOT)</b>\n"
+                                    f"🤖 Pozycja: <b>LONG (Czyste Kupno SPOT)</b>\n"
                                     f"📈 Instrument: <b>{inst['label']}</b>\n"
                                     f"💰 Cena wejścia: <b>{current_price} USDT</b>\n"
                                     f"📦 Wielkość pozycji: <b>{calculated_qty}</b> (Zaryzykowano 1% konta)\n"
                                     f"──────────────────────────────\n"
                                     f"📊 <b>PARAMETRY MATEMATYCZNE:</b>\n"
-                                    f"  • Z-Score: <code>{z}</code>\n"
-                                    f"  • RSI (14): <code>{rsi}</code>\n"
+                                    f"  • Z-Score: <code>{z}</code> (Okazja Statystyczna)\n"
+                                    f"  • RSI (14): <code>{rsi}</code> (Skrajne Wyprzedanie)\n"
                                     f"  • Trend (EMA): <code>{trend}</code>\n"
                                     f"  • Zmienność (ATR): <code>{round(atr, 6)}</code>\n"
                                     f"──────────────────────────────\n"
@@ -404,33 +414,7 @@ async def run_async_pipeline():
                                     f"  • 🛑 <b>STOP LOSS:</b> <code>{round(current_price - stop_loss_distance, 4)} USDT</code>\n"
                                     f"  • 🎯 <b>TAKE PROFIT:</b> <code>{round(take_profit, 4)} USDT</code>\n"
                                     f"──────────────────────────────\n"
-                                    f"<i>Wiadomość wygenerowana automatycznie przez silnik na Renderze.</i>"
-                                )
-                        
-                        elif z >= 2.0 and trend == "SHORT_ONLY" and rsi >= 65:
-                            logger.debug(f"[EXECUTION-TRIGGER] Wszystkie warunki SHORT spełnione dla {inst['label']}. Wysyłam zlecenie SELL.")
-                            order_res = await binance.execute_market_order(inst["symbol"], "SELL", calculated_qty)
-                            if order_res and order_res.get("status") == "FILLED":
-                                take_profit = current_price - (stop_loss_distance * 1.5)
-                                await tg.push(
-                                    f"🟥 <b>[TRADING SYSTEM V7.0: ORDER FILLED]</b>\n"
-                                    f"──────────────────────────────\n"
-                                    f"🤖 Pozycja: <b>SHORT (Sprzedaż SPOT)</b>\n"
-                                    f"📈 Instrument: <b>{inst['label']}</b>\n"
-                                    f"💰 Cena wejścia: <b>{current_price} USDT</b>\n"
-                                    f"📦 Wielkość pozycji: <b>{calculated_qty}</b> (Zaryzykowano 1% konta)\n"
-                                    f"──────────────────────────────\n"
-                                    f"📊 <b>PARAMETRY MATEMATYCZNE:</b>\n"
-                                    f"  • Z-Score: <code>{z}</code>\n"
-                                    f"  • RSI (14): <code>{rsi}</code>\n"
-                                    f"  • Trend (EMA): <code>{trend}</code>\n"
-                                    f"  • Zmienność (ATR): <code>{round(atr, 6)}</code>\n"
-                                    f"──────────────────────────────\n"
-                                    f"🛡️ <b>ZARZĄDZANIE RYZYKIEM (R:R 1:1.5):</b>\n"
-                                    f"  • 🛑 <b>STOP LOSS:</b> <code>{round(current_price + stop_loss_distance, 4)} USDT</code>\n"
-                                    f"  • 🎯 <b>TAKE PROFIT:</b> <code>{round(take_profit, 4)} USDT</code>\n"
-                                    f"──────────────────────────────\n"
-                                    f"<i>Wiadomość wygenerowana automatycznie przez silnik na Renderze.</i>"
+                                    f"<i>Wiadomość wygenerowana automatycznie przez silnik PURE SPOT na Renderze.</i>"
                                 )
             
             gc.collect()
