@@ -414,23 +414,30 @@ async def run_async_pipeline():
                         # TUTAJ WKLEJAMY: TU BYŁ STARY WARUNEK PRODUKCYJNY "if z <= -2.0..."
                         # =========================================================================
                         # --- WARUNKOWY TEST INTEGRACJI TELEGRAMA (TYMCZASOWY EMULATOR) ---
-                        if z >= 1.0 and rsi >= 50:  # Emulator testowy - reaguje na obecny stan rynku z logów
-                            logger.warning(f"⚠️ [TEST-TRIGGER] Wymuszenie sygnału testowego dla {inst['label']}. Wysyłam powiadomienie.")
+                        if order_value_usdt < 11.0:
+                            calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
+                            calculated_qty = max(inst["min_qty"], calculated_qty)
+
+                        # =========================================================================
+                        # PANCERNY EMULATOR BEZWARUNKOWY - WYMUSZENIE STRZAŁU TELEGRAMA
+                        # =========================================================================
+                        # Test aktywuje się zawsze (True), ignorując aktualne wartości rynkowe
+                        if True: 
+                            logger.warning(f"⚠️ [MANDATORY-TEST-TRIGGER] Wymuszenie wysyłki dla {inst['label']}. Sprawdzanie API...")
                             
-                            # Symulacja struktury odpowiedzi FILLED bez angażowania środków na giełdzie
                             take_profit = current_price + (stop_loss_distance * 1.5)
                             await tg.push(
-                                f"🟩 <b>[TEST INTEGRACJI BetAnalyst v5.0]</b>\n"
+                                f"🟩 <b>[BEZWARUNKOWY TEST ŁĄCZNOŚCI BetAnalyst]</b>\n"
                                 f"──────────────────────────────\n"
-                                f"🤖 Status połączenia: <b>POŁĄCZONO POPRAWNIE</b>\n"
-                                f"📈 Testowany instrument: <b>{inst['label']}</b>\n"
-                                f"💰 Kurs emulowany: <b>{current_price} USDT</b>\n"
+                                f"🚀 Silnik na Renderze: <b>WYMUSZENIE SYGNAŁU</b>\n"
+                                f"📈 Instrument: <b>{inst['label']}</b>\n"
+                                f"💰 Cena rynkowa: <b>{current_price} USDT</b>\n"
                                 f"──────────────────────────────\n"
-                                f"📊 Metryki z logów: Z: <code>{z}</code> | RSI: <code>{rsi}</code>\n"
-                                f"<i>Jeśli widzisz tę wiadomość, Twój bot na Renderze poprawnie komunikuje się z API Telegrama.</i>"
+                                f"📊 Odczyt z bazy: Z-Score = <code>{z}</code> | RSI = <code>{rsi}</code>\n"
+                                f"<i>Wiadomość wysłana w trybie bezwarunkowego testu API.</i>"
                             )
                         # =========================================================================
-                        # KONIEC BLOKU EMULATORA TESTOWEGO
+                        # KONIEC BLOKU EMULATORA
                         # =========================================================================
 
             gc.collect()
