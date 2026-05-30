@@ -74,7 +74,7 @@ class TokenBucketRateLimiter:
                 self.tokens -= 1.0
 
 # =========================================================================
-# POMOST UPSTASH REDIS (ODPORNY NA USZKODZONE REKORDY HEX + FIX UTC)
+# POMOST UPSTASH REDIS (PANCERNE PARSOWANIE STRUKTURY UPSTASH PIPELINE)
 # =========================================================================
 class UpstashRedisTradingBridge:
     def __init__(self, url: str, token: str, session: aiohttp.ClientSession):
@@ -95,15 +95,13 @@ class UpstashRedisTradingBridge:
         if not hex_string or hex_string in ["None", "NULL", "none", "null"]:
             return None
         try:
-            # Eliminacja białych znaków i walidacja struktury szesnastkowej
             clean_hex = hex_string.strip()
             return msgpack.unpackb(bytes.fromhex(clean_hex), strict_map_key=False)
         except Exception:
-            # Ciche ignorowanie uszkodzonych próbek historycznych bez wysadzania bota
             return None
 
     async def push_historical_tick(self, market_id: str, tick_data: Dict[str, Any], max_elements: int = 50) -> bool:
-        """Wpycha cenę i pobiera historię przez Upstash Pipeline z poprawnym parsowaniem listy."""
+        """Wpycha cenę i pobiera historię przez Upstash Pipeline z precyzyjnym rozpakowaniem słownika."""
         if not self.url: return False
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
@@ -123,9 +121,10 @@ class UpstashRedisTradingBridge:
                 results = await resp.json()
                 
                 if isinstance(results, list) and len(results) >= 3:
-                    hex_list = results[2]
+                    # KOREKTA (Marta "LeakHunter"): Rezultat trzeciego polecenia to słownik {"result": [...]}
+                    cmd_res = results[2]
+                    hex_list = cmd_res.get("result", []) if isinstance(cmd_res, dict) else []
                     
-                    # Implementacja pancernego dekodowania z filtracją uszkodzonych danych
                     parsed_ticks = []
                     for h in hex_list:
                         unpacked = self._safe_unpack_hex(h)
