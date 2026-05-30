@@ -25,9 +25,9 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO), 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Algorithmic_Trading_Engine_v8.1_PANCERNY")
+logger = logging.getLogger("Algorithmic_Trading_Engine_v5.1_PRODUCTION")
 
-logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota [Pancerny Rdzeń Binance PURE SPOT v8.1]")
+logger.info("⚙️ [SYSTEM-INIT] Uruchamianie CAŁOŚCIOWEGO silnika [Binance PURE SPOT Core v5.1]")
 
 BACKGROUND_LOOP = None
 PIPELINE_LOCK = None  
@@ -91,7 +91,6 @@ class UpstashRedisTradingBridge:
         return key if key.startswith(self.prefix) else f"{self.prefix}{key}"
 
     def _safe_unpack_hex(self, hex_string: str) -> Optional[Dict[str, Any]]:
-        """Bezpiecznie dekoduje ciąg HEX chroniąc przed awariami formatu."""
         if not hex_string or hex_string in ["None", "NULL", "none", "null"]:
             return None
         try:
@@ -101,7 +100,6 @@ class UpstashRedisTradingBridge:
             return None
 
     async def push_historical_tick(self, market_id: str, tick_data: Dict[str, Any], max_elements: int = 50) -> bool:
-        """Wpycha cenę i pobiera historię przez Upstash Pipeline z precyzyjnym rozpakowaniem słownika."""
         if not self.url: return False
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
@@ -121,7 +119,6 @@ class UpstashRedisTradingBridge:
                 results = await resp.json()
                 
                 if isinstance(results, list) and len(results) >= 3:
-                    # KOREKTA (Marta "LeakHunter"): Rezultat trzeciego polecenia to słownik {"result": [...]}
                     cmd_res = results[2]
                     hex_list = cmd_res.get("result", []) if isinstance(cmd_res, dict) else []
                     
@@ -139,7 +136,6 @@ class UpstashRedisTradingBridge:
             return False
 
     async def get_historical_ticks(self, market_id: str, max_elements: int = 50) -> List[Dict[str, Any]]:
-        """Zwraca dane z bufora RAM. W przypadku błędu aktywuje bezpieczny fallback."""
         cached_data = self._pipeline_cache.pop(market_id, None)
         if cached_data is not None:
             logger.debug(f"[REDIS-CACHE] Pobrano serię historyczną {market_id} z pamięci podręcznej (Oszczędność I/O)")
@@ -253,7 +249,7 @@ class AlgorithmicQuantCore:
         }
 
 # =========================================================================
-# SYSTEMOWY KLIENT BINANCE SPOT (ELASTEZNA ARCHITEKTURA TESTNET/LIVE)
+# SYSTEMOWY KLIENT BINANCE SPOT (PEŁNA ŚWIADOMOŚĆ STANU KONTA)
 # =========================================================================
 class BinanceSpotClient:
     def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter):
@@ -267,6 +263,7 @@ class BinanceSpotClient:
         return hmac.new(self.secret_key.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
     async def get_account_balance(self) -> float:
+        """Pobiera wolne saldo konta w czasie rzeczywistym na potrzeby Position Sizingu."""
         if not self.api_key or not self.secret_key: 
             return 10000.0  
         await self.rate_limiter.consume()
@@ -322,7 +319,7 @@ class BinanceSpotClient:
             return None
 
 # =========================================================================
-# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE V8.1 - PEŁNY SQUAD)
+# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (BRAMKA DWUTOROWA v5.1)
 # =========================================================================
 async def run_async_pipeline():
     global RATE_LIMITER, PIPELINE_LOCK
@@ -333,7 +330,7 @@ async def run_async_pipeline():
         return
     
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [POTOK V8.1] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
+        logger.info("🕵️ [POTOK V5.1] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
         if RATE_LIMITER is None: 
             RATE_LIMITER = TokenBucketRateLimiter()
         
@@ -350,9 +347,10 @@ async def run_async_pipeline():
             )
             
             binance = BinanceSpotClient(session, RATE_LIMITER)
+            
+            # 1. BOT SPRAWDZA STAN KONTA (Zna stan kapitału do Position Sizingu)
             total_balance = await binance.get_account_balance()
             
-            # PRZYWRÓCONY KOMPLETNY RADAR WALUTOWY (Zgodnie z wymaganiem Dyrektora)
             instruments = [
                 {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5},
                 {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4},
@@ -386,7 +384,7 @@ async def run_async_pipeline():
                         
                         logger.debug(
                             f"[DECISION-TREE-{inst['label']}] Ocena filtrów SPOT (Tylko Kupno): "
-                            f"Z-Score ok? {z <= -2.0} (Wartość: {z}) | "
+                            f"Z-Score ok? {z <= -1.5} (Wartość: {z}) | "
                             f"RSI Kupno ok? {rsi <= 35} (Wartość: {rsi}) | "
                             f"Trend wzrostowy ok? {trend == 'LONG_ONLY'} (Wartość: {trend})"
                         )
@@ -395,6 +393,7 @@ async def run_async_pipeline():
                             logger.info(f"⚠️ [{inst['label']}] Blokada strategii: Skrajnie niski BandWidth ({bandwidth}). Rynek w fazie ścisku.")
                             continue
 
+                        # 2. BOT WIE ZA ILE OTWORZYĆ POZYCJĘ (Zawsze 1% ryzyka kapitału konta)
                         risk_capital = total_balance * 0.01  
                         stop_loss_distance = atr * 2         
                         
@@ -404,38 +403,45 @@ async def run_async_pipeline():
                         else:
                             calculated_qty = inst["min_qty"]
 
+                        # Zabezpieczenie przed progiem wartości minimalnej giełdy (< 11 USDT)
                         order_value_usdt = calculated_qty * current_price
                         if order_value_usdt < 11.0:
                             calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
                             calculated_qty = max(inst["min_qty"], calculated_qty)
 
-                        if z <= -2.0 and trend == "LONG_ONLY" and rsi <= 35:
-                            logger.debug(f"[EXECUTION-TRIGGER] Czysty sygnał SPOT zakupu dla {inst['label']}. Wysyłam BUY.")
+                        # --- ROZWIĄZANIE PARADOKSU: DWUTOROWA BRAMKA DECYZYJNA R&D ---
+                        standard_buy = (z <= -1.5 and trend == "LONG_ONLY" and rsi <= 35)
+                        crash_buy = (z <= -2.5 and rsi <= 20)  # Pancerna ścieżka łapania krachów
+                        
+                        if standard_buy or crash_buy:
+                            logger.info(f"🚨 [EXECUTION-TRIGGER] Wyzwolenie zakupu SPOT dla {inst['label']}. (Standard: {standard_buy}, Crash: {crash_buy})")
                             order_res = await inst["client"].execute_market_order(inst["symbol"], "BUY", calculated_qty)
                             
                             if order_res and order_res.get("status") == "FILLED":
                                 take_profit = current_price + (stop_loss_distance * 1.5)
                                 await tg.push(
-                                    f"🟩 <b>[TRADING SYSTEM V8.1: ORDER FILLED]</b>\n"
+                                    f"🟩 <b>[TRADING SYSTEM v5.1: ORDER FILLED]</b>\n"
+                                    f"──────────────────────────────\n"
+                                    f"🤖 Strategia: <b>Mean Reversion (Pure SPOT)</b>\n"
                                     f"📈 Instrument: <b>{inst['label']}</b>\n"
                                     f"💰 Cena wejścia: <b>{current_price} USDT</b>\n"
+                                    f"📦 Wielkość pozycji: <b>{calculated_qty}</b> (Podział 1% ryzyka konta)\n"
+                                    f"──────────────────────────────\n"
                                     f"🛡️ STOP LOSS: <code>{round(current_price - stop_loss_distance, 4)} USDT</code>\n"
-                                    f"🎯 TAKE PROFIT: <code>{round(take_profit, 4)} USDT</code>"
+                                    f"🎯 TAKE PROFIT: <code>{round(take_profit, 4)} USDT</code>\n"
+                                    f"──────────────────────────────"
                                 )
             gc.collect()
 
 # =========================================================================
-# NAPRAWIONY ASYNCHRONICZNY CRON (BEZ KONFLIKTU WĄTKÓW)
+# ASYNCHRONICZNY CRON I WĄTEK SPOCZYNKOWY
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT
     logger.info("⚡ [TRADING ONLINE] Silnik gotowy na wyzwalanie zewnętrzne przez endpoint.")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
-    
-    # Pętla oczekiwania - sygnały są teraz bezpiecznie obsługiwane przez wątek główny
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         await asyncio.sleep(1)
-    
     logger.info("👋 [SHUTDOWN] Potok zamknięty bezpiecznie. Wszystkie stany skonsolidowane.")
 
 def background_scheduler_thread():
@@ -490,26 +496,22 @@ def export_analytics_safe_json():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # =========================================================================
-# INICJACJA I BEZPIECZNA OBSŁUGA SYGNAŁÓW W WĄTKU GŁÓWNYM (MAIN THREAD)
+# INICJACJA I BEZPIECZNA OBSŁUGA SYGNAŁÓW W WĄTKU GŁÓWNYM
 # =========================================================================
 if __name__ == "__main__":
-    # 1. Uruchomienie asynchronicznego tradingu w tle
+    import sys
+    
     worker_thread = threading.Thread(target=background_scheduler_thread, daemon=True)
     worker_thread.start()
     
-    # 2. Pancerny system przechwytywania sygnałów w głównym interpreterze (Marta Spec)
     def main_thread_shutdown_handler(signum, frame):
         logger.warning(f"🛑 [SIGTERM/SIGINT] Przechwycono sygnał {signum} w wątku głównym. Wyłączanie bota...")
         if BACKGROUND_LOOP and ASYNC_SHUTDOWN_EVENT:
             BACKGROUND_LOOP.call_soon_threadsafe(ASYNC_SHUTDOWN_EVENT.set)
-        # Krótka zwłoka na wyczyszczenie potoków sieciowych
         time.sleep(1.5)
         sys.exit(0)
 
-    # Rejestracja systemowa w Main Thread
-    import sys
     signal.signal(signal.SIGTERM, main_thread_shutdown_handler)
     signal.signal(signal.SIGINT, main_thread_shutdown_handler)
 
-    # 3. Start serwera Flask (Wątek główny, blokujący)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False)
