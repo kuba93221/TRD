@@ -405,41 +405,23 @@ async def run_async_pipeline():
                             calculated_qty = inst["min_qty"]
 
                         order_value_usdt = calculated_qty * current_price
-                   # ... (wyliczenia wielkości pozycji calculated_qty oraz order_value_usdt wyżej) ...
                         if order_value_usdt < 11.0:
                             calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
                             calculated_qty = max(inst["min_qty"], calculated_qty)
 
-                        # =========================================================================
-                        # TUTAJ WKLEJAMY: TU BYŁ STARY WARUNEK PRODUKCYJNY "if z <= -2.0..."
-                        # =========================================================================
-                        # --- WARUNKOWY TEST INTEGRACJI TELEGRAMA (TYMCZASOWY EMULATOR) ---
-                        if order_value_usdt < 11.0:
-                            calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
-                            calculated_qty = max(inst["min_qty"], calculated_qty)
-
-                        # =========================================================================
-                        # PANCERNY EMULATOR BEZWARUNKOWY - WYMUSZENIE STRZAŁU TELEGRAMA
-                        # =========================================================================
-                        # Test aktywuje się zawsze (True), ignorując aktualne wartości rynkowe
-                        if True: 
-                            logger.warning(f"⚠️ [MANDATORY-TEST-TRIGGER] Wymuszenie wysyłki dla {inst['label']}. Sprawdzanie API...")
+                        if z <= -2.0 and trend == "LONG_ONLY" and rsi <= 35:
+                            logger.debug(f"[EXECUTION-TRIGGER] Czysty sygnał SPOT zakupu dla {inst['label']}. Wysyłam BUY.")
+                            order_res = await inst["client"].execute_market_order(inst["symbol"], "BUY", calculated_qty)
                             
-                            take_profit = current_price + (stop_loss_distance * 1.5)
-                            await tg.push(
-                                f"🟩 <b>[BEZWARUNKOWY TEST ŁĄCZNOŚCI BetAnalyst]</b>\n"
-                                f"──────────────────────────────\n"
-                                f"🚀 Silnik na Renderze: <b>WYMUSZENIE SYGNAŁU</b>\n"
-                                f"📈 Instrument: <b>{inst['label']}</b>\n"
-                                f"💰 Cena rynkowa: <b>{current_price} USDT</b>\n"
-                                f"──────────────────────────────\n"
-                                f"📊 Odczyt z bazy: Z-Score = <code>{z}</code> | RSI = <code>{rsi}</code>\n"
-                                f"<i>Wiadomość wysłana w trybie bezwarunkowego testu API.</i>"
-                            )
-                        # =========================================================================
-                        # KONIEC BLOKU EMULATORA
-                        # =========================================================================
-
+                            if order_res and order_res.get("status") == "FILLED":
+                                take_profit = current_price + (stop_loss_distance * 1.5)
+                                await tg.push(
+                                    f"🟩 <b>[TRADING SYSTEM V8.1: ORDER FILLED]</b>\n"
+                                    f"📈 Instrument: <b>{inst['label']}</b>\n"
+                                    f"💰 Cena wejścia: <b>{current_price} USDT</b>\n"
+                                    f"🛡️ STOP LOSS: <code>{round(current_price - stop_loss_distance, 4)} USDT</code>\n"
+                                    f"🎯 TAKE PROFIT: <code>{round(take_profit, 4)} USDT</code>"
+                                )
             gc.collect()
 
 # =========================================================================
