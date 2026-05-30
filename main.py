@@ -13,7 +13,7 @@ import requests
 import hmac
 import hashlib
 from urllib.parse import urlencode
-from datetime import datetime
+from datetime import datetime, UTC
 from flask import Flask, jsonify
 from typing import Dict, Any, List, Optional
 
@@ -25,9 +25,9 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO), 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Algorithmic_Trading_Engine_v8.0_PURE_SPOT")
+logger = logging.getLogger("Algorithmic_Trading_Engine_v8.1_PANCERNY")
 
-logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota w bezpiecznej gałęzi DEV [Pancerny Rdzeń Binance PURE SPOT]")
+logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO bota [Pancerny Rdzeń Binance PURE SPOT v8.1]")
 
 BACKGROUND_LOOP = None
 PIPELINE_LOCK = None  
@@ -74,7 +74,7 @@ class TokenBucketRateLimiter:
                 self.tokens -= 1.0
 
 # =========================================================================
-# POMOST UPSTASH REDIS (KOREKTA PARSOWANIA PIPELINE + POPRAWKA UTC 2026)
+# POMOST UPSTASH REDIS (ODPORNY NA USZKODZONE REKORDY HEX + FIX UTC)
 # =========================================================================
 class UpstashRedisTradingBridge:
     def __init__(self, url: str, token: str, session: aiohttp.ClientSession):
@@ -89,6 +89,18 @@ class UpstashRedisTradingBridge:
 
     def _enforce_prefix(self, key: str) -> str:
         return key if key.startswith(self.prefix) else f"{self.prefix}{key}"
+
+    def _safe_unpack_hex(self, hex_string: str) -> Optional[Dict[str, Any]]:
+        """Bezpiecznie dekoduje ciąg HEX chroniąc przed awariami formatu."""
+        if not hex_string or hex_string in ["None", "NULL", "none", "null"]:
+            return None
+        try:
+            # Eliminacja białych znaków i walidacja struktury szesnastkowej
+            clean_hex = hex_string.strip()
+            return msgpack.unpackb(bytes.fromhex(clean_hex), strict_map_key=False)
+        except Exception:
+            # Ciche ignorowanie uszkodzonych próbek historycznych bez wysadzania bota
+            return None
 
     async def push_historical_tick(self, market_id: str, tick_data: Dict[str, Any], max_elements: int = 50) -> bool:
         """Wpycha cenę i pobiera historię przez Upstash Pipeline z poprawnym parsowaniem listy."""
@@ -108,17 +120,19 @@ class UpstashRedisTradingBridge:
                 if resp.status != 200: 
                     return False
                 
-                # Upstash zwraca bezpośrednio LISTĘ wyników dla każdego polecenia w pipeline
                 results = await resp.json()
                 
                 if isinstance(results, list) and len(results) >= 3:
-                    # Rezultatem trzeciego polecenia (LRANGE) jest lista spakowanych HEX-ów
                     hex_list = results[2]
                     
-                    self._pipeline_cache[market_id] = [
-                        msgpack.unpackb(bytes.fromhex(h), strict_map_key=False) 
-                        for h in hex_list if h and h not in ["None", "NULL"]
-                    ]
+                    # Implementacja pancernego dekodowania z filtracją uszkodzonych danych
+                    parsed_ticks = []
+                    for h in hex_list:
+                        unpacked = self._safe_unpack_hex(h)
+                        if unpacked:
+                            parsed_ticks.append(unpacked)
+                            
+                    self._pipeline_cache[market_id] = parsed_ticks
                     return True
                 return False
         except Exception as e:
@@ -140,15 +154,20 @@ class UpstashRedisTradingBridge:
                 if response.status != 200: return []
                 res_json = await response.json()
                 hex_list = res_json.get("result", []) if isinstance(res_json, dict) else []
-                return [msgpack.unpackb(bytes.fromhex(h), strict_map_key=False) for h in hex_list if h and h not in ["None", "NULL"]]
+                
+                parsed_ticks = []
+                for h in hex_list:
+                    unpacked = self._safe_unpack_hex(h)
+                    if unpacked:
+                        parsed_ticks.append(unpacked)
+                return parsed_ticks
         except Exception as e:
             logger.error(f"❌ [REDIS FALLBACK ERROR] {market_id}: {e}")
             return []
 
     async def incr_metric(self, field_name: str):
         if not self.url: return
-        # Zgodność z Python 3.11+: Zastąpienie deprecated utcnow() bezpiecznym standardem strefowym
-        current_date = datetime.now(datetime.UTC).strftime('%Y-%m-%d')
+        current_date = datetime.now(UTC).strftime('%Y-%m-%d')
         key = self._enforce_prefix(f"ANALYTICS:{field_name}:{current_date}")
         try:
             async with self.session.get(f"{self.url}/incr/{key}", headers=self.headers, timeout=3) as resp: 
@@ -183,7 +202,6 @@ class AlgorithmicQuantCore:
     
     @staticmethod
     def _calculate_ema(prices: List[float], period: int = 15) -> float:
-        """Szybkie wyliczenie EMA dla dostępnej podpróby."""
         if len(prices) < period: return prices[0]
         k = 2 / (period + 1)
         ema = prices[-1]
@@ -193,7 +211,6 @@ class AlgorithmicQuantCore:
 
     @staticmethod
     def _calculate_rsi(prices: List[float], period: int = 14) -> float:
-        """Klasyczny oscylator momentum RSI."""
         if len(prices) < period + 1: return 50.0
         gains = 0.0
         losses = 0.0
@@ -213,7 +230,6 @@ class AlgorithmicQuantCore:
             logger.debug(f"[QUANT-DEBUG] Niewystarczająca próba danych: {n}/20 próbek. Pomijam kalkulację.")
             return None  
 
-        # 1. Obliczenia bazowe Z-Score
         sma = sum(prices) / n
         variance = sum((x - sma) ** 2 for x in prices) / n
         std_dev = math.sqrt(variance)
@@ -221,16 +237,11 @@ class AlgorithmicQuantCore:
         current_price = prices[0]
         z_score = (current_price - sma) / std_dev
 
-        # 2. FILTR TRENDU: Filtrowanie trendu (EMA zastępcze dla okna wektora)
         ema_trend = AlgorithmicQuantCore._calculate_ema(prices, period=15)
         trend_direction = "LONG_ONLY" if current_price >= ema_trend else "SHORT_ONLY"
-
-        # 3. FILTR MOMENTUM: RSI
         rsi_val = AlgorithmicQuantCore._calculate_rsi(prices, period=14)
-
-        # 4. ZMIENNOŚĆ: Bollinger BandWidth i ATR (szacowany z odchylenia/serii)
         bandwidth = (std_dev * 4) / sma if sma != 0 else 0.0
-        atr_estimated = std_dev * 0.5  # Matematyczny ekwiwalent zmienności średniej
+        atr_estimated = std_dev * 0.5
 
         return {
             "current": current_price,
@@ -243,12 +254,10 @@ class AlgorithmicQuantCore:
         }
 
 # =========================================================================
-# SYSTEMOWY KLIENT BINANCE SPOT (ELASTYCZNA ARCHITEKTURA TESTNET/LIVE)
+# SYSTEMOWY KLIENT BINANCE SPOT (ELASTEZNA ARCHITEKTURA TESTNET/LIVE)
 # =========================================================================
 class BinanceSpotClient:
-    """Obsługuje interfejs giełdowy Binance SPOT w środowisku testowym oraz produkcyjnym."""
     def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter):
-        # Pobieranie adresu URL z konfiguracji - ułatwia przesiadkę bez dotykania kodu źródłowego
         self.base_url = os.environ.get("BINANCE_API_URL", "https://testnet.binance.vision/api/v3").rstrip('/')
         self.session = session
         self.rate_limiter = rate_limiter
@@ -259,9 +268,7 @@ class BinanceSpotClient:
         return hmac.new(self.secret_key.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
     async def get_account_balance(self) -> float:
-        """Pobiera dostępne wolne saldo USDT z giełdy SPOT do wyliczenia pozycji."""
         if not self.api_key or not self.secret_key: 
-            logger.debug("[BINANCE-DEBUG] Brak zdefiniowanych kluczy API. Zwracam saldo awaryjne 10000 USDT.")
             return 10000.0  
         await self.rate_limiter.consume()
         timestamp = int(time.time() * 1000)
@@ -275,9 +282,7 @@ class BinanceSpotClient:
                 balances = data.get("balances", [])
                 for b in balances:
                     if b.get("asset") == "USDT": 
-                        free_usdt = float(b.get("free", 0))
-                        logger.debug(f"[BINANCE-DEBUG] Pobrane saldo konta SPOT: {free_usdt} USDT")
-                        return free_usdt
+                        return float(b.get("free", 0))
                 return 10000.0
         except Exception as e:
             logger.error(f"[BINANCE-ERROR] Błąd pobierania salda: {e}")
@@ -289,16 +294,13 @@ class BinanceSpotClient:
             url = f"{self.base_url}/ticker/price?symbol={symbol}"
             async with self.session.get(url, timeout=5) as response:
                 if response.status != 200: 
-                    logger.debug(f"[BINANCE-DEBUG] {symbol} błąd HTTP {response.status}")
                     return None
                 data = await response.json()
                 return {"source": "BINANCE_SPOT", "symbol": symbol, "last": float(data.get("price", 0))}
         except Exception as e:
-            logger.debug(f"[BINANCE-DEBUG] Wyjątek połączenia dla {symbol}: {e}")
             return None
 
     async def execute_market_order(self, symbol: str, side: str, quantity: float) -> Optional[Dict[str, Any]]:
-        """Wysyła rygorystyczne zlecenie rynkowe BUY na giełdę SPOT."""
         if not self.api_key or not self.secret_key: return None
         await self.rate_limiter.consume()
         timestamp = int(time.time() * 1000)
@@ -315,15 +317,13 @@ class BinanceSpotClient:
         headers = {"X-MBX-APIKEY": self.api_key}
         try:
             async with self.session.post(url, headers=headers, timeout=5) as r:
-                res_data = await r.json()
-                logger.debug(f"[TRANSACTION-RESPONSE] Odpowiedź giełdy SPOT: {res_data}")
-                return res_data
+                return await r.json()
         except Exception as e:
-            logger.error(f"[TRANSACTION-ERROR] Krytyczny błąd wysyłania zlecenia {side} dla {symbol}: {e}")
+            logger.error(f"[TRANSACTION-ERROR] Krytyczny błąd zlecenia {side} dla {symbol}: {e}")
             return None
 
 # =========================================================================
-# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE V8.0 PURE SPOT)
+# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (PIPELINE V8.1 - PEŁNY SQUAD)
 # =========================================================================
 async def run_async_pipeline():
     global RATE_LIMITER, PIPELINE_LOCK
@@ -334,7 +334,7 @@ async def run_async_pipeline():
         return
     
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [POTOK V8.0] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
+        logger.info("🕵️ [POTOK V8.1] Pobieranie próbek z silnika Binance i analiza wielokryteriowa...")
         if RATE_LIMITER is None: 
             RATE_LIMITER = TokenBucketRateLimiter()
         
@@ -353,7 +353,7 @@ async def run_async_pipeline():
             binance = BinanceSpotClient(session, RATE_LIMITER)
             total_balance = await binance.get_account_balance()
             
-            # SKANER WALUTOWY SPOT: BTC, ETH, SOL, BNB, LINK, XRP
+            # PRZYWRÓCONY KOMPLETNY RADAR WALUTOWY (Zgodnie z wymaganiem Dyrektora)
             instruments = [
                 {"client": binance, "symbol": "BTCUSDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5},
                 {"client": binance, "symbol": "ETHUSDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4},
@@ -385,7 +385,6 @@ async def run_async_pipeline():
                         logger.info(f"📊 [{inst['label']}] P: {current_price} | Z: {z} | RSI: {rsi} | Bw: {bandwidth} | T: {trend}")
                         await redis_trade.incr_metric(f"ticks_{inst['label']}")
                         
-                        # TRYB DIAGNOSTYCZNY BRAMKI DECYZYJNEJ (Naprawiono błąd abs(z) -> Sprawdzamy czyste ujemne z_score dla SPOT)
                         logger.debug(
                             f"[DECISION-TREE-{inst['label']}] Ocena filtrów SPOT (Tylko Kupno): "
                             f"Z-Score ok? {z <= -2.0} (Wartość: {z}) | "
@@ -393,12 +392,10 @@ async def run_async_pipeline():
                             f"Trend wzrostowy ok? {trend == 'LONG_ONLY'} (Wartość: {trend})"
                         )
                         
-                        # 3. ZMIENNOŚĆ: Filtr Bollinger BandWidth
                         if bandwidth < 0.001:
                             logger.info(f"⚠️ [{inst['label']}] Blokada strategii: Skrajnie niski BandWidth ({bandwidth}). Rynek w fazie ścisku.")
                             continue
 
-                        # 4. MATEMATYKA PORTFELA (Position Sizing - Ryzyko oparte na stop_loss_distance)
                         risk_capital = total_balance * 0.01  
                         stop_loss_distance = atr * 2         
                         
@@ -408,42 +405,24 @@ async def run_async_pipeline():
                         else:
                             calculated_qty = inst["min_qty"]
 
-                        # FILTR WARUNKU MINIMALNEGO KAPITAŁU (Zabezpieczenie przed odrzuceniem Notional wartości < 10 USDT)
                         order_value_usdt = calculated_qty * current_price
                         if order_value_usdt < 11.0:
-                            logger.debug(f"[NOTIONAL-FILTER] Obliczona wartość zlecenia ({round(order_value_usdt, 2)} USDT) poniżej minimum SPOT. Podbijam do progu bezpiecznego.")
                             calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
-                            # Ponowne sprawdzenie zaokrąglenia wymaganego przez krok minimalny
                             calculated_qty = max(inst["min_qty"], calculated_qty)
 
-                        # --- RESTRUKTURYZACJA DECYZJI: WYŁĄCZNIE PURE SPOT LONG (KUPNO) ---
                         if z <= -2.0 and trend == "LONG_ONLY" and rsi <= 35:
-                            logger.debug(f"[EXECUTION-TRIGGER] Czysty sygnał SPOT zakupu wyzwolony dla {inst['label']}. Wysyłam zlecenie BUY.")
+                            logger.debug(f"[EXECUTION-TRIGGER] Czysty sygnał SPOT zakupu dla {inst['label']}. Wysyłam BUY.")
                             order_res = await inst["client"].execute_market_order(inst["symbol"], "BUY", calculated_qty)
                             
                             if order_res and order_res.get("status") == "FILLED":
                                 take_profit = current_price + (stop_loss_distance * 1.5)
                                 await tg.push(
-                                    f"🟩 <b>[TRADING SYSTEM V8.0: ORDER FILLED]</b>\n"
-                                    f"──────────────────────────────\n"
-                                    f"🤖 Pozycja: <b>LONG (Czyste Kupno SPOT)</b>\n"
+                                    f"🟩 <b>[TRADING SYSTEM V8.1: ORDER FILLED]</b>\n"
                                     f"📈 Instrument: <b>{inst['label']}</b>\n"
                                     f"💰 Cena wejścia: <b>{current_price} USDT</b>\n"
-                                    f"📦 Wielkość pozycji: <b>{calculated_qty}</b> (Zaryzykowano 1% konta)\n"
-                                    f"──────────────────────────────\n"
-                                    f"📊 <b>PARAMETRY MATEMATYCZNE:</b>\n"
-                                    f"  • Z-Score: <code>{z}</code> (Okazja Statystyczna)\n"
-                                    f"  • RSI (14): <code>{rsi}</code> (Skrajne Wyprzedanie)\n"
-                                    f"  • Trend (EMA): <code>{trend}</code>\n"
-                                    f"  • Zmienność (ATR): <code>{round(atr, 6)}</code>\n"
-                                    f"──────────────────────────────\n"
-                                    f"🛡️ <b>ZARZĄDZANIE RYZYKIEM (R:R 1:1.5):</b>\n"
-                                    f"  • 🛑 <b>STOP LOSS:</b> <code>{round(current_price - stop_loss_distance, 4)} USDT</code>\n"
-                                    f"  • 🎯 <b>TAKE PROFIT:</b> <code>{round(take_profit, 4)} USDT</code>\n"
-                                    f"──────────────────────────────\n"
-                                    f"<i>Wiadomość wygenerowana automatycznie przez silnik PURE SPOT na Renderze.</i>"
+                                    f"🛡️ STOP LOSS: <code>{round(current_price - stop_loss_distance, 4)} USDT</code>\n"
+                                    f"🎯 TAKE PROFIT: <code>{round(take_profit, 4)} USDT</code>"
                                 )
-            
             gc.collect()
 
 # =========================================================================
@@ -451,10 +430,24 @@ async def run_async_pipeline():
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT
-    logger.info("⚡ [TRADING ONLINE] Silnik matematyczny gotowy na wyzwalanie zewnętrzne przez endpoint.")
+    logger.info("⚡ [TRADING ONLINE] Silnik gotowy na wyzwalanie zewnętrzne przez endpoint.")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
+    
+    # Rejestracja obsługi bezpiecznego wyłączania (Graceful Shutdown)
+    def stop_handler():
+        logger.warning("🛑 [SIGTERM/SIGINT] Przechwycono sygnał zamknięcia kontenera Render. Kończenie pracy...")
+        ASYNC_SHUTDOWN_EVENT.set()
+    
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop_handler)
+    except NotImplementedError:
+        pass # Zabezpieczenie dla środowisk developerskich Windows
+        
     while not ASYNC_SHUTDOWN_EVENT.is_set():
-        await asyncio.sleep(5)
+        await asyncio.sleep(1)
+    
+    logger.info("👋 [SHUTDOWN] Potok zamknięty bezpiecznie. Wszystkie stany skonsolidowane.")
 
 def background_scheduler_thread():
     global BACKGROUND_LOOP
@@ -464,7 +457,7 @@ def background_scheduler_thread():
     try: 
         loop.run_until_complete(continuous_async_cron(loop))
     except Exception as e: 
-        logger.error(f"[CRITICAL THREAD FAILURE] Awaria watku tła tradingu: {e}")
+        logger.error(f"[CRITICAL THREAD FAILURE] Awaria wątku tła: {e}")
     finally: 
         loop.close()
 
