@@ -48,12 +48,13 @@ def health_check():
     return "OK", 200
 
 # =========================================================================
-# WIZJER DIAGNOSTYCZNY AUTORYZACJI OKX (DUAL MODE: DEMO VS PRODUCTION)
+# WIZJER DIAGNOSTYCZNY AUTORYZACJI OKX (RYGORYSTYCZNY FORMAT PODPISU DEMO)
 # =========================================================================
 @app.route('/test-auth', methods=['GET'])
 def web_test_okx_handshake():
-    """Weryfikacja nowego klucza 599e9262... w trybie symulacyjnym oraz produkcyjnym."""
+    """Rygorystyczny test autoryzacji klucza Demo na endpoincie /api/v5/account/config."""
     import urllib.error
+    import time
 
     api_key = str(os.environ.get("OKX_API_KEY", "")).strip()
     secret_key = str(os.environ.get("OKX_SECRET_KEY", "")).strip()
@@ -70,18 +71,21 @@ def web_test_okx_handshake():
     }
 
     if not all([api_key, secret_key, passphrase]):
-        report["error"] = "Brak wymaganych zmiennych środowiskowych w panelu Render!"
+        report["error"] = "Brak wymaganych zmiennych w panelu Render!"
         return jsonify(report), 400
 
-    # Testujemy oba warianty nagłówka: DEMO vs PRODUKCJA
-    variants = [
-        ("TEST_TRYBU_DEMO", True),
-        ("TEST_TRYBU_PRODUKCYJNEGO_LIVE", False)
+    # Wariant A: ISO 8601 UTC z 3 miejscami po przecinku (standard V5)
+    # Wariant B: Czysty Unix Timestamp w sekundach
+    iso_ts = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+    epoch_ts = str(int(time.time()))
+
+    test_formats = [
+        ("FORMAT_ISO_UTC", iso_ts),
+        ("FORMAT_EPOCH_SEC", epoch_ts)
     ]
 
-    for label, is_demo in variants:
-        timestamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        message = f"{timestamp}GET{request_path}"
+    for label, ts in test_formats:
+        message = f"{ts}GET{request_path}"
         mac = hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
         signature = base64.b64encode(mac.digest()).decode('utf-8')
 
@@ -90,33 +94,32 @@ def web_test_okx_handshake():
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "OK-ACCESS-KEY": api_key,
             "OK-ACCESS-SIGN": signature,
-            "OK-ACCESS-TIMESTAMP": timestamp,
-            "OK-ACCESS-PASSPHRASE": passphrase
+            "OK-ACCESS-TIMESTAMP": ts,
+            "OK-ACCESS-PASSPHRASE": passphrase,
+            "x-simulated-trading": "1"
         }
-        if is_demo:
-            headers["x-simulated-trading"] = "1"
 
         try:
             req = Request(f"{base_url}{request_path}", headers=headers, method="GET")
             with urlopen(req, timeout=6) as resp:
                 resp_data = json.loads(resp.read().decode('utf-8'))
                 report["trials"].append({
-                    "tryb": label,
+                    "format": label,
                     "http_status": resp.status,
                     "okx_code": resp_data.get("code"),
                     "okx_msg": resp_data.get("msg"),
-                    "acctLv": resp_data.get("data", [{}])[0].get("acctLv") if resp_data.get("data") else None
+                    "data": resp_data.get("data")
                 })
         except urllib.error.HTTPError as he:
             err_body = he.read().decode('utf-8', errors='ignore')
             report["trials"].append({
-                "tryb": label,
+                "format": label,
                 "http_status": he.code,
-                "response": err_body[:250]
+                "response": err_body[:200]
             })
         except Exception as e:
             report["trials"].append({
-                "tryb": label,
+                "format": label,
                 "exception": str(e)
             })
 
