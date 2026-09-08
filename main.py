@@ -48,11 +48,11 @@ def health_check():
     return "OK", 200
 
 # =========================================================================
-# WIZJER DIAGNOSTYCZNY AUTORYZACJI OKX (ENDPOINT KONFIGURACJI KONTA)
+# WIZJER DIAGNOSTYCZNY AUTORYZACJI OKX (DUAL MODE: DEMO VS PRODUCTION)
 # =========================================================================
 @app.route('/test-auth', methods=['GET'])
 def web_test_okx_handshake():
-    """Weryfikacja autoryzacji OKX na bazowym endpoincie /api/v5/account/config."""
+    """Weryfikacja nowego klucza 599e9262... w trybie symulacyjnym oraz produkcyjnym."""
     import urllib.error
 
     api_key = str(os.environ.get("OKX_API_KEY", "")).strip()
@@ -73,44 +73,52 @@ def web_test_okx_handshake():
         report["error"] = "Brak wymaganych zmiennych środowiskowych w panelu Render!"
         return jsonify(report), 400
 
-    timestamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-    message = f"{timestamp}GET{request_path}"
-    mac = hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
-    signature = base64.b64encode(mac.digest()).decode('utf-8')
+    # Testujemy oba warianty nagłówka: DEMO vs PRODUKCJA
+    variants = [
+        ("TEST_TRYBU_DEMO", True),
+        ("TEST_TRYBU_PRODUKCYJNEGO_LIVE", False)
+    ]
 
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "OK-ACCESS-KEY": api_key,
-        "OK-ACCESS-SIGN": signature,
-        "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": passphrase,
-        "x-simulated-trading": "1"
-    }
+    for label, is_demo in variants:
+        timestamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        message = f"{timestamp}GET{request_path}"
+        mac = hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
+        signature = base64.b64encode(mac.digest()).decode('utf-8')
 
-    try:
-        req = Request(f"{base_url}{request_path}", headers=headers, method="GET")
-        with urlopen(req, timeout=6) as resp:
-            resp_data = json.loads(resp.read().decode('utf-8'))
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "OK-ACCESS-KEY": api_key,
+            "OK-ACCESS-SIGN": signature,
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": passphrase
+        }
+        if is_demo:
+            headers["x-simulated-trading"] = "1"
+
+        try:
+            req = Request(f"{base_url}{request_path}", headers=headers, method="GET")
+            with urlopen(req, timeout=6) as resp:
+                resp_data = json.loads(resp.read().decode('utf-8'))
+                report["trials"].append({
+                    "tryb": label,
+                    "http_status": resp.status,
+                    "okx_code": resp_data.get("code"),
+                    "okx_msg": resp_data.get("msg"),
+                    "acctLv": resp_data.get("data", [{}])[0].get("acctLv") if resp_data.get("data") else None
+                })
+        except urllib.error.HTTPError as he:
+            err_body = he.read().decode('utf-8', errors='ignore')
             report["trials"].append({
-                "endpoint": request_path,
-                "http_status": resp.status,
-                "okx_code": resp_data.get("code"),
-                "okx_msg": resp_data.get("msg"),
-                "account_level": resp_data.get("data", [{}])[0].get("acctLv") if resp_data.get("data") else None
+                "tryb": label,
+                "http_status": he.code,
+                "response": err_body[:250]
             })
-    except urllib.error.HTTPError as he:
-        err_body = he.read().decode('utf-8', errors='ignore')
-        report["trials"].append({
-            "endpoint": request_path,
-            "http_status": he.code,
-            "response": err_body[:250]
-        })
-    except Exception as e:
-        report["trials"].append({
-            "endpoint": request_path,
-            "exception": str(e)
-        })
+        except Exception as e:
+            report["trials"].append({
+                "tryb": label,
+                "exception": str(e)
+            })
 
     return jsonify(report), 200
 # =========================================================================
