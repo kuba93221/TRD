@@ -564,27 +564,38 @@ async def run_async_pipeline():
 
                 ticker = await inst["client"].get_market_ticker(inst["symbol"])
 
-                if ticker:
-                    await redis_trade.push_historical_tick(inst["label"], ticker, max_elements=50)
-                    history = await redis_trade.get_historical_ticks(inst["label"], max_elements=50)
+                if not ticker:
+                    logger.warning(f"⚠️ [{inst['label']}] Brak odpowiedzi z giełdy dla kursu SPOT.")
+                    continue
 
-                    macro_candles = await inst["client"].get_macro_candles(inst["symbol"], bar="1H", limit=30)
-                    metrics = AlgorithmicQuantCore.calculate_z_score(history, macro_candles)
+                current_price = ticker.get("last", 0.0)
+                # Zapis do odizolowanej bazy z prefiksem TRADE_ i auto-TTL 7 dni
+                await redis_trade.push_historical_tick(inst["label"], ticker, max_elements=50)
+                history = await redis_trade.get_historical_ticks(inst["label"], max_elements=50)
+                samples_count = len(history)
 
-                    if metrics:
-                        z = metrics["z_score"]
-                        rsi = metrics["rsi"]
-                        bandwidth = metrics["bandwidth"]
-                        trend = metrics["trend"]
-                        atr = metrics["atr"]
-                        current_price = metrics["current"]
+                logger.info(f"📥 [{inst['label']}] Kurs SPOT: {current_price} USDT | Bufor Redis: {samples_count}/20 próbek")
 
-                        logger.info(f"📊 [{inst['label']}] P: {current_price} | Z: {z} | RSI: {rsi} | Bw: {bandwidth} | T: {trend}")
-                        await redis_trade.incr_metric(f"ticks_{inst['label']}")
+                if samples_count < 20:
+                    logger.info(f"⏳ [{inst['label']}] Zbieranie historii próbek ({samples_count}/20)... Silnik wstrzymuje analizę.")
+                    continue
 
-                        if bandwidth < 0.001:
-                            logger.info(f"⚠️ [{inst['label']}] Blokada: BandWidth skrajnie niski ({bandwidth}). Rynek w kompresji.")
-                            continue
+                macro_candles = await inst["client"].get_macro_candles(inst["symbol"], bar="1H", limit=30)
+                metrics = AlgorithmicQuantCore.calculate_z_score(history, macro_candles)
+
+                if metrics:
+                    z = metrics["z_score"]
+                    rsi = metrics["rsi"]
+                    bandwidth = metrics["bandwidth"]
+                    trend = metrics["trend"]
+                    atr = metrics["atr"]
+
+                    logger.info(f"📊 [{inst['label']}] P: {current_price} | Z: {z} | RSI: {rsi} | Bw: {bandwidth} | T: {trend}")
+                    await redis_trade.incr_metric(f"ticks_{inst['label']}")
+
+                    if bandwidth < 0.001:
+                        logger.info(f"⚠️ [{inst['label']}] Blokada: BandWidth skrajnie niski ({bandwidth}). Rynek w kompresji.")
+                        continue
 
                         # Zarządzanie ryzykiem: 1% salda kapitału
                         risk_capital = total_balance * 0.01
