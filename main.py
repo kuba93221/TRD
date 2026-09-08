@@ -548,13 +548,11 @@ async def run_async_pipeline():
             okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
             total_balance = await okx_client.get_account_balance("USDT")
 
-            # Koszyk par w standardzie nazewnictwa OKX (BASE-QUOTE)
+            # Zoptymalizowany koszyk 4 płynnych instrumentów pod takt 3-minutowy (Limit Upstash Free)
             instruments = [
                 {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
                 {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
                 {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_USDT", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-                {"client": okx_client, "symbol": "BNB-USDT", "label": "BNB_USDT", "min_qty": 0.001, "round_digits": 3, "price_round": 1},
-                {"client": okx_client, "symbol": "LINK-USDT", "label": "LINK_USDT", "min_qty": 0.01, "round_digits": 2, "price_round": 3},
                 {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_USDT", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
             ]
 
