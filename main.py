@@ -48,11 +48,13 @@ def health_check():
     return "OK", 200
 
 # =========================================================================
-# WIZJER DIAGNOSTYCZNY AUTORYZACJI OKX (WYWOŁYWANY Z PRZEGLĄDARKI)
+# WIZJER DIAGNOSTYCZNY AUTORYZACJI OKX (Z NAGŁÓWKIEM ANTY-CLOUDFLARE)
 # =========================================================================
 @app.route('/test-auth', methods=['GET'])
 def web_test_okx_handshake():
     """Tymczasowy endpoint diagnostyczny do weryfikacji kluczy w przeglądarce."""
+    import urllib.error
+
     api_key = str(os.environ.get("OKX_API_KEY", "")).strip()
     secret_key = str(os.environ.get("OKX_SECRET_KEY", "")).strip()
     passphrase = str(os.environ.get("OKX_PASSPHRASE", "")).strip()
@@ -78,6 +80,7 @@ def web_test_okx_handshake():
 
         headers = {
             "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "OK-ACCESS-KEY": api_key,
             "OK-ACCESS-SIGN": signature,
             "OK-ACCESS-TIMESTAMP": timestamp,
@@ -94,8 +97,16 @@ def web_test_okx_handshake():
                     "mode": mode_name,
                     "http_status": resp.status,
                     "okx_code": resp_data.get("code"),
-                    "okx_msg": resp_data.get("msg")
+                    "okx_msg": resp_data.get("msg"),
+                    "data": resp_data.get("data")
                 })
+        except urllib.error.HTTPError as he:
+            err_body = he.read().decode('utf-8', errors='ignore')
+            report["trials"].append({
+                "mode": mode_name,
+                "http_status": he.code,
+                "raw_error": err_body[:200]
+            })
         except Exception as e:
             report["trials"].append({
                 "mode": mode_name,
