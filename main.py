@@ -643,12 +643,17 @@ async def run_async_pipeline():
                         calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
                         calculated_qty = max(inst["min_qty"], calculated_qty)
 
-                    # Decyzja wejścia: Standardowe odbicie lub wyprzedaż krachowa
-                    standard_buy = (z <= -1.5 and trend == "LONG_ONLY" and rsi <= 35)
-                    crash_buy = (z <= -2.5 and rsi <= 20)
+                    # =========================================================================
+                    # TRYB TESTOWY WYNIKU (TEST TRIGGER - DO TYMCZASOWEJ WERYFIKACJI)
+                    # =========================================================================
+                    FORCE_TEST_EXECUTION = True  
+
+                    # Decyzja wejścia: Wymuszenie testu lub standardowe warunki matematyczne
+                    standard_buy = FORCE_TEST_EXECUTION or (z <= -1.5 and trend == "LONG_ONLY" and rsi <= 35)
+                    crash_buy = False
 
                     if standard_buy or crash_buy:
-                        logger.info(f"🚨 [EXECUTION-TRIGGER] Kupno SPOT dla {inst['label']} (Standard: {standard_buy}, Crash: {crash_buy})")
+                        logger.info(f"🚨 [EXECUTION-TRIGGER] Kupno SPOT dla {inst['label']} (Test: {FORCE_TEST_EXECUTION})")
                         order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
 
                         if order_res and order_res.get("code") == "0":
