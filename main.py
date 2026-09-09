@@ -585,6 +585,23 @@ async def run_async_pipeline():
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
 
+                # =========================================================================
+                # KONTROLA LIMITU SLOTÓW NA KAŻDY INSTRUMENT (MAX 3 ŁĄCZNIE W PORTFELU)
+                # =========================================================================
+                try:
+                    url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
+                    async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
+                        active_count = 0
+                        if resp_k.status == 200:
+                            data_k = await resp_k.json()
+                            active_count = len(data_k.get("result", []))
+                    
+                    if active_count >= 3:
+                        logger.info(f"🛡️ [PORTFOLIO LIMIT] Osiągnięto limit 3 otwartych pozycji. Pomijam {inst['label']}.")
+                        continue
+                except Exception as e:
+                    logger.error(f"⚠️ [SLOTS CHECK ERROR] Błąd weryfikacji slotów: {e}")
+
                 ticker = await inst["client"].get_market_ticker(inst["symbol"])
 
                 if not ticker:
@@ -619,7 +636,6 @@ async def run_async_pipeline():
                         logger.info(f"⚠️ [{inst['label']}] Blokada: BandWidth skrajnie niski ({bandwidth}). Rynek w kompresji.")
                         continue
 
-                    # Alert wczesnego ostrzegania na Telegram (zbliżanie się do wyprzedania)
                     if -1.5 < z <= -1.2 and trend == "LONG_ONLY":
                         await tg.push(
                             f"👀 <b>[OBSERWACJA: {inst['label']}]</b>\n"
@@ -627,7 +643,6 @@ async def run_async_pipeline():
                             f"Z-Score: <code>{z}</code> | RSI: <code>{rsi}</code> | P: <code>{current_price}</code>"
                         )
 
-                    # Zarządzanie ryzykiem: 1% salda kapitału
                     risk_capital = total_balance * 0.01
                     stop_loss_distance = atr * 2.0
 
@@ -637,23 +652,21 @@ async def run_async_pipeline():
                     else:
                         calculated_qty = inst["min_qty"]
 
-                    # Wymóg minimalnej wartości zlecenia OKX (> 11 USDT)
                     order_value_usdt = calculated_qty * current_price
                     if order_value_usdt < 11.0:
                         calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
                         calculated_qty = max(inst["min_qty"], calculated_qty)
 
                     # =========================================================================
-                    # TRYB TESTOWY WYNIKU (TEST TRIGGER - DO TYMCZASOWEJ WERYFIKACJI)
+                    # WYŁĄCZENIE TRYBU TESTOWEGO - POWRÓT DO CZYSTEJ MATEMATYKI
                     # =========================================================================
-                    FORCE_TEST_EXECUTION = True  
+                    FORCE_TEST_EXECUTION = False  
 
-                    # Decyzja wejścia: Wymuszenie testu lub standardowe warunki matematyczne
                     standard_buy = FORCE_TEST_EXECUTION or (z <= -1.5 and trend == "LONG_ONLY" and rsi <= 35)
-                    crash_buy = False
+                    crash_buy = (z <= -2.5 and rsi <= 20)
 
                     if standard_buy or crash_buy:
-                        logger.info(f"🚨 [EXECUTION-TRIGGER] Kupno SPOT dla {inst['label']} (Test: {FORCE_TEST_EXECUTION})")
+                        logger.info(f"🚨 [EXECUTION-TRIGGER] Kupno SPOT dla {inst['label']}")
                         order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
 
                         if order_res and order_res.get("code") == "0":
@@ -661,11 +674,9 @@ async def run_async_pipeline():
                             price_tp = round(current_price + (stop_loss_distance * 1.5), inst["price_round"])
                             price_sl = round(current_price - stop_loss_distance, inst["price_round"])
 
-                            # Aktywacja obrony OCO po rozliczeniu zakupu
                             await asyncio.sleep(0.3)
                             await inst["client"].execute_oco_protection(inst["symbol"], actual_qty, price_tp, price_sl)
                             
-                            # Oznaczenie aktywnej pozycji w Redis (dla kontroli limitu slotów)
                             await redis_trade.push_historical_tick(f"POS_ACTIVE:{inst['label']}", {"status": "OPEN", "time": time.time()}, max_elements=1)
 
                             await tg.push(
