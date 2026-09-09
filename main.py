@@ -348,7 +348,8 @@ class AlgorithmicQuantCore:
 class OKXSpotClient:
     """Kompletny asynchroniczny klient OKX V5 REST API dla rynku SPOT."""
     def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter, is_sandbox: bool = True):
-        self.base_url = os.environ.get("OKX_API_URL", "https://www.okx.com").rstrip('/')
+        # Aktualizacja URL na europejski klaster OKX (EEA) zgodny z regulacjami
+        self.base_url = os.environ.get("OKX_API_URL", "https://eea.okx.com").rstrip('/')
         self.session = session
         self.rate_limiter = rate_limiter
         self.is_sandbox = is_sandbox
