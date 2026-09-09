@@ -27,12 +27,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Algorithmic_Trading_Engine_v10.0_OKX_PRODUCTION")
 
-logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO silnika v10.0 [OKX SPOT SANDBOX/PRODUCTION]")
+logger.info("⚙️ [SYSTEM-INIT] Uruchamianie PEŁNEGO silnika v10.0 [OKX SPOT USDC PRODUCTION]")
 
 BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
 PIPELINE_LOCK: Optional[asyncio.Lock] = None
 ASYNC_SHUTDOWN_EVENT: Optional[asyncio.Event] = None
 RATE_LIMITER: Optional[Any] = None
+
+# Globalna definicja waluty kwotowanej
+QUOTE_CCY = "USDC"
 
 # =========================================================================
 # SERWER MONITORINGU FLASK (URUCHAMIANY PRODUKCYJNIE NA RENDERZE)
@@ -370,7 +373,7 @@ class BreakoutQuantCore:
         }
 
 # =========================================================================
-# RDZEŃ QUANT 4: GRID TRADING (SIATKA KONSOLIDACYJNA - ETAP 3)
+# RDZEŃ QUANT 4: GRID TRADING (SIATKA KONSOLIDACYJNA)
 # =========================================================================
 class GridQuantCore:
     @staticmethod
@@ -379,7 +382,6 @@ class GridQuantCore:
         grid_step_pct: float = 0.005, 
         levels: int = 3
     ) -> Optional[Dict[str, Any]]:
-        """Weryfikuje reżim konsolidacji bocznej i wyznacza drabinkę siatki."""
         if len(candles) < 20:
             return None
 
@@ -422,7 +424,7 @@ class GridQuantCore:
         }
 
 # =========================================================================
-# SYSTEMOWY KLIENT GIEŁDY OKX SPOT (V5 REST API - SANDBOX & PRODUCTION)
+# SYSTEMOWY KLIENT GIEŁDY OKX SPOT (V5 REST API - SPOT USDC)
 # =========================================================================
 class OKXSpotClient:
     def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter, is_sandbox: bool = True):
@@ -456,10 +458,10 @@ class OKXSpotClient:
             headers["x-simulated-trading"] = "1"
         return headers
 
-    async def get_account_balance(self, ccy: str = "USDT") -> float:
+    async def get_account_balance(self, ccy: str = "USDC") -> float:
         if not self.api_key or not self.secret_key or not self.passphrase:
-            logger.warning("[OKX-WARN] Brak pełnych danych uwierzytelniających. Używam salda testowego 1000.0 USDT.")
-            return 1000.0 if self.is_sandbox else 0.0
+            logger.warning("[OKX-WARN] Brak pełnych danych uwierzytelniających.")
+            return 0.0
 
         await self.rate_limiter.consume()
         request_path = f"/api/v5/account/balance?ccy={ccy}"
@@ -475,15 +477,15 @@ class OKXSpotClient:
                     for bal in details:
                         if bal.get("ccy") == ccy:
                             avail = float(bal.get("availBal", 0.0))
-                            return avail if avail > 0 else 1000.0
+                            return avail
                     total = float(data["data"][0].get("totalEq", 0.0))
-                    return total if total > 0 else 1000.0
+                    return total
 
-                logger.warning(f"⚠️ [OKX-BALANCE-WARN] Giełda zwróciła code={code}, msg={data.get('msg')}. Używam bezpiecznego fallbacku Sandbox (1000.0 USDT).")
-                return 1000.0 if self.is_sandbox else 0.0
+                logger.warning(f"⚠️ [OKX-BALANCE-WARN] Giełda zwróciła code={code}, msg={data.get('msg')}.")
+                return 0.0
         except Exception as e:
-            logger.error(f"❌ [OKX-BALANCE-EXCEPTION] Błąd pobierania salda: {e}. Używam bezpiecznego fallbacku (1000.0 USDT).")
-            return 1000.0 if self.is_sandbox else 0.0
+            logger.error(f"❌ [OKX-BALANCE-EXCEPTION] Błąd pobierania salda: {e}.")
+            return 0.0
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         await self.rate_limiter.consume()
@@ -576,7 +578,6 @@ class OKXSpotClient:
             return None
 
     async def execute_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Optional[Dict[str, Any]]:
-        """Egzekucja pasywnego zlecenia z limitem ceny dla siatki (Grid Trading)."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None
         await self.rate_limiter.consume()
@@ -632,7 +633,7 @@ class OKXSpotClient:
             return None
 
 # =========================================================================
-# STRATEGIA 1: CENTRALNY POTOK POWROTU DO ŚREDNIEJ (MEAN REVERSION)
+# STRATEGIA 1: CENTRALNY POTOK POWROTU DO ŚREDNIEJ (MEAN REVERSION - USDC)
 # =========================================================================
 async def run_async_pipeline():
     global RATE_LIMITER, PIPELINE_LOCK
@@ -643,7 +644,7 @@ async def run_async_pipeline():
         return
 
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [POTOK OKX] Skanowanie koszyka rynków SPOT i analiza wielokryteriowa...")
+        logger.info("🕵️ [POTOK OKX] Skanowanie koszyka rynków SPOT USDC i analiza wielokryteriowa...")
         if RATE_LIMITER is None:
             RATE_LIMITER = TokenBucketRateLimiter()
 
@@ -660,7 +661,7 @@ async def run_async_pipeline():
             )
 
             okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
-            total_balance = await okx_client.get_account_balance("USDT")
+            total_balance = await okx_client.get_account_balance(QUOTE_CCY)
 
             try:
                 url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
@@ -677,10 +678,10 @@ async def run_async_pipeline():
                 logger.error(f"⚠️ [SLOTS CHECK ERROR] Błąd weryfikacji slotów portfela: {e}")
 
             instruments = [
-                {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
-                {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-                {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_USDT", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-                {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_USDT", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+                {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
+                {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
+                {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
+                {"client": okx_client, "symbol": f"XRP-{QUOTE_CCY}", "label": f"XRP_{QUOTE_CCY}", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
             ]
 
             for inst in instruments:
@@ -711,7 +712,7 @@ async def run_async_pipeline():
                 history = await redis_trade.get_historical_ticks(inst["label"], max_elements=50)
                 samples_count = len(history)
 
-                logger.info(f"📥 [{inst['label']}] Kurs SPOT: {current_price} USDT | Bufor Redis: {samples_count}/20 próbek")
+                logger.info(f"📥 [{inst['label']}] Kurs SPOT: {current_price} {QUOTE_CCY} | Bufor Redis: {samples_count}/20 próbek")
 
                 if samples_count < 20:
                     logger.info(f"⏳ [{inst['label']}] Zbieranie historii próbek ({samples_count}/20)... Silnik wstrzymuje analizę.")
@@ -741,12 +742,18 @@ async def run_async_pipeline():
                             f"Z-Score: <code>{z}</code> | RSI: <code>{rsi}</code> | P: <code>{current_price}</code>"
                         )
 
+                    # Bezpieczny kalkulator alokacji Mean Reversion (max 25% salda)
                     risk_capital = total_balance * 0.01
                     stop_loss_distance = atr * 2.0
-                    calculated_qty = max(inst["min_qty"], round(risk_capital / stop_loss_distance, inst["round_digits"])) if stop_loss_distance > 0 else inst["min_qty"]
+                    sl_pct = (stop_loss_distance / current_price) if current_price > 0 else 0.02
+                    sl_pct = max(0.01, sl_pct)
+                    
+                    position_value = min(risk_capital / sl_pct, total_balance * 0.25)
+                    calculated_qty = round(position_value / current_price, inst["round_digits"])
+                    calculated_qty = max(inst["min_qty"], calculated_qty)
 
-                    order_value_usdt = calculated_qty * current_price
-                    if order_value_usdt < 11.0:
+                    order_value_quote = calculated_qty * current_price
+                    if order_value_quote < 11.0:
                         calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
                         calculated_qty = max(inst["min_qty"], calculated_qty)
 
@@ -755,7 +762,7 @@ async def run_async_pipeline():
                     crash_buy = (z <= -2.5 and rsi <= 20)
 
                     if standard_buy or crash_buy:
-                        logger.info(f"🚨 [EXECUTION-TRIGGER] Kupno SPOT dla {inst['label']}")
+                        logger.info(f"🚨 [EXECUTION-TRIGGER] Kupno SPOT dla {inst['label']} | Ilość: {calculated_qty}")
                         order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
 
                         if order_res and order_res.get("code") == "0":
@@ -776,37 +783,40 @@ async def run_async_pipeline():
                                 f"──────────────────────────────\n"
                                 f"🤖 Tryb: <b>SPOT (Mean Reversion)</b>\n"
                                 f"📈 Instrument: <b>{inst['label']}</b>\n"
-                                f"💰 Kurs wejścia: <b>{current_price} USDT</b>\n"
+                                f"💰 Kurs wejścia: <b>{current_price} {QUOTE_CCY}</b>\n"
                                 f"📦 Wielkość: <b>{actual_qty}</b> (Ryzyko: 1% konta)\n"
                                 f"──────────────────────────────\n"
                                 f"🛡️ <b>OCHRONA OCO (ALGO):</b>\n"
-                                f"  • 🎯 Take Profit: <code>{price_tp} USDT</code>\n"
-                                f"  • 🛑 Stop Loss: <code>{price_sl} USDT</code>\n"
+                                f"  • 🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code>\n"
+                                f"  • 🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code>\n"
                                 f"──────────────────────────────"
                             )
+                        else:
+                            err_c = order_res.get("code") if order_res else "ERR"
+                            err_m = order_res.get("msg") if order_res else "Connection error"
+                            logger.error(f"❌ [MEAN-REV-REJECTED] Błąd zlecenia {inst['label']}: Code {err_c} -> {err_m}")
+
             gc.collect()
 
 # =========================================================================
-# STRATEGIA 2: WORKER MOMENTUM W TLE (SYNCHRO 180s + TELEMETRIA)
+# STRATEGIA 2: WORKER MOMENTUM W TLE (SYNCHRO 180s - USDC)
 # =========================================================================
 async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🚀 [MOMENTUM-WORKER] Uruchomiono niezależny wątek analityczny Momentum w tle.")
     
     instruments = [
-        {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_MOM", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
-        {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_MOM", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-        {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_MOM", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-        {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_MOM", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+        {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}_MOM", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
+        {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}_MOM", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
+        {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}_MOM", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
+        {"client": okx_client, "symbol": f"XRP-{QUOTE_CCY}", "label": f"XRP_{QUOTE_CCY}_MOM", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
     ]
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         try:
             url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
             async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
-                active_count = 0
-                if resp_k.status == 200:
-                    data_k = await resp_k.json()
-                    active_count = len(data_k.get("result", []))
+                active_keys = (await resp_k.json()).get("result", []) if resp_k.status == 200 else []
+                active_count = len(active_keys)
             
             if active_count >= 3:
                 logger.info("🛡️ [MOMENTUM] Limit 3 pozycji osiągnięty. Worker wstrzymuje skanowanie.")
@@ -817,6 +827,9 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
                 
+                if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
+                    continue
+
                 candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=20)
                 mom_metrics = MomentumQuantCore.calculate_momentum(candles_raw, period=10)
                 
@@ -826,10 +839,18 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                     if mom_metrics["signal"]:
                         logger.info(f"🚨 [MOMENTUM-TRIGGER] Spełniono warunek impulsu dla {inst['label']}!")
                         current_price = mom_metrics["current"]
-                        total_balance = await inst["client"].get_account_balance("USDT")
+                        total_balance = await inst["client"].get_account_balance(QUOTE_CCY)
                         
                         risk_capital = total_balance * 0.01
-                        calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.02), inst["round_digits"]))
+                        sl_pct = 0.02
+                        position_value = min(risk_capital / sl_pct, total_balance * 0.25)
+                        
+                        calculated_qty = round(position_value / current_price, inst["round_digits"])
+                        calculated_qty = max(inst["min_qty"], calculated_qty)
+                        
+                        if (calculated_qty * current_price) < 11.0:
+                            calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
+                            calculated_qty = max(inst["min_qty"], calculated_qty)
                         
                         order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
                         if order_res and order_res.get("code") == "0":
@@ -843,34 +864,40 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                                 {"status": "OPEN", "type": "MOMENTUM", "time": time.time()}, 
                                 max_elements=1
                             )
+                            active_keys.append(f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}")
+                            
                             await tg_dispatcher.push(
                                 f"🚀 <b>[MOMENTUM ENGINE: TRADE DEPLOYED]</b>\n"
                                 f"──────────────────────────────\n"
                                 f"📈 Instrument: <b>{inst['label']}</b> | ROC: <code>{mom_metrics['roc']}%</code>\n"
-                                f"💰 Wejście: <b>{current_price} USDT</b>\n"
-                                f"🎯 TP (+3%): <code>{price_tp} USDT</code> | 🛑 SL (-2%): <code>{price_sl} USDT</code>"
+                                f"💰 Wejście: <b>{current_price} {QUOTE_CCY}</b>\n"
+                                f"📦 Wielkość: <b>{calculated_qty}</b>\n"
+                                f"🎯 TP (+3%): <code>{price_tp} {QUOTE_CCY}</code> | 🛑 SL (-2%): <code>{price_sl} {QUOTE_CCY}</code>"
                             )
+                        else:
+                            err_c = order_res.get("code") if order_res else "ERR"
+                            err_m = order_res.get("msg") if order_res else "Connection timeout"
+                            logger.error(f"❌ [MOMENTUM-REJECTED] Błąd zlecenia {inst['label']}: Code {err_c} -> {err_m}")
         except Exception as e:
             logger.error(f"❌ [MOMENTUM-ERROR] Błąd w workerze Momentum: {e}")
         
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 3: WORKER BREAKOUT W TLE (POPRAWIONE WCIĘCIA + PEŁNA DIAGNOSTYKA)
+# STRATEGIA 3: WORKER BREAKOUT W TLE (POPRAWIONA ALOKACJA - USDC)
 # =========================================================================
 async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("💥 [BREAKOUT-WORKER] Uruchomiono niezależny wątek Breakout w tle.")
     
     instruments = [
-        {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_BRK", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
-        {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_BRK", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-        {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_BRK", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-        {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_BRK", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+        {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}_BRK", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
+        {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}_BRK", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
+        {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}_BRK", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
+        {"client": okx_client, "symbol": f"XRP-{QUOTE_CCY}", "label": f"XRP_{QUOTE_CCY}_BRK", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
     ]
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         try:
-            # 1. Weryfikacja globalnego limitu 3 pozycji
             url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
             async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
                 active_keys = (await resp_k.json()).get("result", []) if resp_k.status == 200 else []
@@ -885,7 +912,6 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
                 
-                # 2. Blokada dublowania: pomijamy instrument, jeśli ma już otwartą pozycję Breakout
                 if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
                     continue
 
@@ -898,18 +924,21 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                     
                     if brk_metrics["signal"]:
                         logger.info(f"🚨 [BREAKOUT-TRIGGER] Wykryto potwierdzone wybicie dla {inst['label']}!")
-                        total_balance = await inst["client"].get_account_balance("USDT")
+                        total_balance = await inst["client"].get_account_balance(QUOTE_CCY)
                         
                         risk_capital = total_balance * 0.01
-                        calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.025), inst["round_digits"]))
+                        sl_pct = 0.02
+                        position_value = min(risk_capital / sl_pct, total_balance * 0.25)
                         
-                        # Zabezpieczenie minimalnej wartości zlecenia (min. 11 USDT)
+                        calculated_qty = round(position_value / current_price, inst["round_digits"])
+                        calculated_qty = max(inst["min_qty"], calculated_qty)
+                        
                         if (calculated_qty * current_price) < 11.0:
                             calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
+                            calculated_qty = max(inst["min_qty"], calculated_qty)
 
                         order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
                         
-                        # 3. Weryfikacja odpowiedzi z giełdy i raportowanie
                         if order_res and order_res.get("code") == "0":
                             price_tp = round(current_price * 1.04, inst["price_round"])
                             price_sl = round(current_price * 0.98, inst["price_round"])
@@ -927,9 +956,9 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                                 f"💥 <b>[BREAKOUT ENGINE: TRADE DEPLOYED]</b>\n"
                                 f"──────────────────────────────\n"
                                 f"📈 Instrument: <b>{inst['label']}</b> | Bw: <code>{brk_metrics['bandwidth']}</code>\n"
-                                f"💰 Wejście: <b>{current_price} USDT</b>\n"
+                                f"💰 Wejście: <b>{current_price} {QUOTE_CCY}</b>\n"
                                 f"📦 Wielkość: <b>{calculated_qty}</b>\n"
-                                f"🎯 TP (+4%): <code>{price_tp} USDT</code> | 🛑 SL (-2%): <code>{price_sl} USDT</code>"
+                                f"🎯 TP (+4%): <code>{price_tp} {QUOTE_CCY}</code> | 🛑 SL (-2%): <code>{price_sl} {QUOTE_CCY}</code>"
                             )
                         else:
                             err_code = order_res.get("code") if order_res else "BRAK_ODPOWIEDZI"
@@ -946,25 +975,23 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
         except Exception as e:
             logger.error(f"❌ [BREAKOUT-ERROR] Błąd w workerze Breakout: {e}")
         
-        # Prawidłowe wcięcie: uśpienie całego cyklu workera na 180 sekund
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 4: WORKER GRID TRADING (POPRAWKA: BLOKADA DUBLI I FORMATOWANIE CENY)
+# STRATEGIA 4: WORKER GRID TRADING (POPRAWIONA ALOKACJA - USDC)
 # =========================================================================
 async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🧱 [GRID-WORKER] Uruchomiono niezależny wątek Grid Trading w tle.")
     
     instruments = [
-        {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_GRID", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
-        {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_GRID", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-        {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_GRID", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-        {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_GRID", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+        {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}_GRID", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
+        {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}_GRID", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
+        {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}_GRID", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
+        {"client": okx_client, "symbol": f"XRP-{QUOTE_CCY}", "label": f"XRP_{QUOTE_CCY}_GRID", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
     ]
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         try:
-            # 1. Globalna weryfikacja limitu 3 pozycji
             url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
             async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
                 active_keys = (await resp_k.json()).get("result", []) if resp_k.status == 200 else []
@@ -979,9 +1006,7 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
                 
-                # 2. Idempotency Lock: Pomijamy instrument, jeśli ten Grid już ma otwartą pozycję
                 if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
-                    logger.debug(f"⏳ [GRID-HOLD] Pozycja dla {inst['label']} jest już aktywna. Pomijam.")
                     continue
 
                 candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=30)
@@ -992,23 +1017,25 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                     
                     if grid_metrics["is_consolidation"]:
                         first_level = grid_metrics["levels"][0]
-                        
-                        # Rygorystyczne zaokrąglenie ceny pod specyfikację giełdy
                         price_buy = round(first_level["buy_price"], inst["price_round"])
                         price_tp = round(first_level["tp_price"], inst["price_round"])
                         
-                        total_balance = await inst["client"].get_account_balance("USDT")
-                        risk_capital = total_balance * 0.01
+                        total_balance = await inst["client"].get_account_balance(QUOTE_CCY)
                         
-                        # Weryfikacja minimalnej wartości zlecenia (min. 11 USDT dla OKX)
-                        calculated_qty = max(inst["min_qty"], round(risk_capital / price_buy, inst["round_digits"]))
+                        risk_capital = total_balance * 0.01
+                        sl_pct = 0.015
+                        position_value = min(risk_capital / sl_pct, total_balance * 0.15)
+                        
+                        calculated_qty = round(position_value / price_buy, inst["round_digits"])
+                        calculated_qty = max(inst["min_qty"], calculated_qty)
+                        
                         if (calculated_qty * price_buy) < 11.0:
                             calculated_qty = max(calculated_qty, round(11.0 / price_buy, inst["round_digits"]))
+                            calculated_qty = max(inst["min_qty"], calculated_qty)
 
                         logger.info(f"🚨 [GRID-TRIGGER] Składanie zlecenia Limit dla {inst['label']} | Cena: {price_buy} | Ilość: {calculated_qty}")
                         order_res = await inst["client"].execute_limit_order(inst["symbol"], "buy", calculated_qty, price_buy)
                         
-                        # 3. Pełna telemetria odpowiedzi z OKX
                         if order_res and order_res.get("code") == "0":
                             price_sl = round(price_buy * 0.985, inst["price_round"])
                             await redis_trade.push_historical_tick(
@@ -1016,17 +1043,16 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                                 {"status": "OPEN", "type": "GRID", "order_id": order_res["data"][0]["ordId"], "time": time.time()}, 
                                 max_elements=1
                             )
-                            # Odświeżamy listę aktywnych kluczy w locie
                             active_keys.append(f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}")
                             
                             await tg_dispatcher.push(
                                 f"🧱 <b>[GRID ENGINE: LIMIT ORDER PLACED]</b>\n"
                                 f"──────────────────────────────\n"
                                 f"📈 Instrument: <b>{inst['label']}</b>\n"
-                                f"📥 Kupno (Limit L1): <b>{price_buy} USDT</b>\n"
+                                f"📥 Kupno (Limit L1): <b>{price_buy} {QUOTE_CCY}</b>\n"
                                 f"📦 Wielkość: <b>{calculated_qty}</b>\n"
-                                f"🎯 Take Profit: <code>{price_tp} USDT</code> (+0.5%)\n"
-                                f"🛑 Stop Loss: <code>{price_sl} USDT</code> (-1.5%)"
+                                f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code> (+0.5%)\n"
+                                f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-1.5%)"
                             )
                         else:
                             error_msg = order_res.get("msg") if order_res else "Brak odpowiedzi HTTP"
@@ -1103,7 +1129,7 @@ def manual_analysis_trigger():
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
         return jsonify({"status": "error", "message": "Potok tradingu nie jest gotowy."}), 500
     asyncio.run_coroutine_threadsafe(run_async_pipeline(), BACKGROUND_LOOP)
-    return jsonify({"status": "success", "message": "Analiza rynków OKX uruchomiona pomyślnie."}), 200
+    return jsonify({"status": "success", "message": f"Analiza rynków OKX ({QUOTE_CCY}) uruchomiona pomyślnie."}), 200
 
 @app.route('/export-analytics', methods=['GET'])
 def export_analytics_safe_json():
