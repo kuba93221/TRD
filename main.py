@@ -424,6 +424,41 @@ class GridQuantCore:
         }
 
 # =========================================================================
+# RDZEŃ ARBITRAŻU REŻIMÓW RYNKOWYCH & PAMIĘĆ PODRĘCZNA ŚWIEC (LEKKA ARCHITEKTURA)
+# =========================================================================
+class MarketRegimeArbitrator:
+    _cache: Dict[str, Dict[str, Any]] = {}
+    _TTL: float = 120.0  # Świece 15m są ważne w RAM przez 2 minuty
+
+    @classmethod
+    async def get_candles(cls, okx_client, symbol: str) -> List[List[str]]:
+        now = time.monotonic()
+        if symbol in cls._cache and (now - cls._cache[symbol]["time"] < cls._TTL):
+            return cls._cache[symbol]["data"]
+
+        candles = await okx_client.get_macro_candles_raw(symbol, bar="15m", limit=30)
+        if candles:
+            cls._cache[symbol] = {"data": candles, "time": now}
+        return candles or []
+
+    @staticmethod
+    def get_regime(candles: List[List[str]]) -> str:
+        if len(candles) < 20:
+            return "NEUTRAL"
+
+        closes = [float(c[4]) for c in candles]
+        sma = sum(closes[-20:]) / 20.0
+        variance = sum((x - sma) ** 2 for x in closes[-20:]) / 20.0
+        std_dev = math.sqrt(variance) if variance > 0 else 1e-6
+        bandwidth = (std_dev * 4.0) / sma if sma > 0 else 0.0
+
+        if bandwidth > 0.020:
+            return "TRENDING"
+        elif bandwidth <= 0.015:
+            return "RANGING"
+        return "NEUTRAL"
+
+# =========================================================================
 # SYSTEMOWY KLIENT GIEŁDY OKX SPOT (V5 REST API - SPOT USDC)
 # =========================================================================
 class OKXSpotClient:
@@ -533,7 +568,7 @@ class OKXSpotClient:
             logger.error(f"[OKX-CANDLES-EXCEPTION] Błąd pobierania świec makro {symbol}: {e}")
             return []
 
-    async def get_macro_candles_raw(self, symbol: str, bar: str = "15m", limit: int = 20) -> List[List[str]]:
+    async def get_macro_candles_raw(self, symbol: str, bar: str = "15m", limit: int = 30) -> List[List[str]]:
         await self.rate_limiter.consume()
         request_path = f"/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
         url = f"{self.base_url}{request_path}"
@@ -680,8 +715,7 @@ async def run_async_pipeline():
             instruments = [
                 {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
                 {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-                {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-                {"client": okx_client, "symbol": f"XRP-{QUOTE_CCY}", "label": f"XRP_{QUOTE_CCY}", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+                {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}", "min_qty": 0.01, "round_digits": 2, "price_round": 2}
             ]
 
             for inst in instruments:
@@ -799,7 +833,7 @@ async def run_async_pipeline():
             gc.collect()
 
 # =========================================================================
-# STRATEGIA 2: WORKER MOMENTUM W TLE (SYNCHRO 180s - USDC)
+# STRATEGIA 2: WORKER MOMENTUM W TLE (SYNCHRO 180s - ARBITRAŻ REŻIMU)
 # =========================================================================
 async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🚀 [MOMENTUM-WORKER] Uruchomiono niezależny wątek analityczny Momentum w tle.")
@@ -807,8 +841,7 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
     instruments = [
         {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}_MOM", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
         {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}_MOM", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-        {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}_MOM", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-        {"client": okx_client, "symbol": f"XRP-{QUOTE_CCY}", "label": f"XRP_{QUOTE_CCY}_MOM", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+        {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}_MOM", "min_qty": 0.01, "round_digits": 2, "price_round": 2}
     ]
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
@@ -830,11 +863,19 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                 if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
                     continue
 
-                candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=20)
+                # POBRANIE WSPÓŁDZIELONYCH ŚWIEC Z CACHE
+                candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
+                regime = MarketRegimeArbitrator.get_regime(candles_raw)
+                
+                # BLOKADA W REŻIMIE KONSOLIDACJI (RANGING)
+                if regime == "RANGING":
+                    logger.debug(f"🛑 [MOMENTUM-BLOCK] {inst['label']} w reżimie RANGING. Momentum wygaszone.")
+                    continue
+
                 mom_metrics = MomentumQuantCore.calculate_momentum(candles_raw, period=10)
                 
                 if mom_metrics:
-                    logger.info(f"📈 [MOMENTUM-SCAN] {inst['label']} | ROC: {mom_metrics['roc']}% (Próg: > +2.0%) | P: {mom_metrics['current']}")
+                    logger.info(f"📈 [MOMENTUM-SCAN] {inst['label']} | Reżim: {regime} | ROC: {mom_metrics['roc']}% (Próg: > +2.0%) | P: {mom_metrics['current']}")
                     
                     if mom_metrics["signal"]:
                         logger.info(f"🚨 [MOMENTUM-TRIGGER] Spełniono warunek impulsu dla {inst['label']}!")
@@ -884,7 +925,7 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 3: WORKER BREAKOUT W TLE (POPRAWIONA ALOKACJA - USDC)
+# STRATEGIA 3: WORKER BREAKOUT W TLE (SYNCHRO 180s - ARBITRAŻ REŻIMU)
 # =========================================================================
 async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("💥 [BREAKOUT-WORKER] Uruchomiono niezależny wątek Breakout w tle.")
@@ -892,8 +933,7 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
     instruments = [
         {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}_BRK", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
         {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}_BRK", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-        {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}_BRK", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-        {"client": okx_client, "symbol": f"XRP-{QUOTE_CCY}", "label": f"XRP_{QUOTE_CCY}_BRK", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+        {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}_BRK", "min_qty": 0.01, "round_digits": 2, "price_round": 2}
     ]
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
@@ -915,7 +955,8 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                 if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
                     continue
 
-                candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=30)
+                # POBRANIE WSPÓŁDZIELONYCH ŚWIEC Z CACHE
+                candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
                 brk_metrics = BreakoutQuantCore.calculate_breakout(candles_raw, period=20)
                 
                 if brk_metrics:
@@ -978,7 +1019,7 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 4: WORKER GRID TRADING (POPRAWIONA ALOKACJA - USDC)
+# STRATEGIA 4: WORKER GRID TRADING (SYNCHRO 180s - ARBITRAŻ REŻIMU)
 # =========================================================================
 async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🧱 [GRID-WORKER] Uruchomiono niezależny wątek Grid Trading w tle.")
@@ -986,8 +1027,7 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
     instruments = [
         {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}_GRID", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
         {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}_GRID", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-        {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}_GRID", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-        {"client": okx_client, "symbol": f"XRP-{QUOTE_CCY}", "label": f"XRP_{QUOTE_CCY}_GRID", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+        {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}_GRID", "min_qty": 0.01, "round_digits": 2, "price_round": 2}
     ]
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
@@ -1009,11 +1049,19 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                 if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
                     continue
 
-                candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=30)
+                # POBRANIE WSPÓŁDZIELONYCH ŚWIEC Z CACHE
+                candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
+                regime = MarketRegimeArbitrator.get_regime(candles_raw)
+                
+                # BLOKADA W REŻIMIE SILNEGO TRENDU (TRENDING)
+                if regime == "TRENDING":
+                    logger.debug(f"🛑 [GRID-BLOCK] {inst['label']} w reżimie TRENDING. Grid wygaszony.")
+                    continue
+
                 grid_metrics = GridQuantCore.calculate_grid_levels(candles_raw, grid_step_pct=0.005, levels=3)
                 
                 if grid_metrics:
-                    logger.info(f"🧱 [GRID-SCAN] {inst['label']} | ATR: {grid_metrics['atr_pct']}% | ROC: {grid_metrics['roc']}% | Konsolidacja: {grid_metrics['is_consolidation']}")
+                    logger.info(f"🧱 [GRID-SCAN] {inst['label']} | Reżim: {regime} | ATR: {grid_metrics['atr_pct']}% | ROC: {grid_metrics['roc']}% | Konsolidacja: {grid_metrics['is_consolidation']}")
                     
                     if grid_metrics["is_consolidation"]:
                         first_level = grid_metrics["levels"][0]
