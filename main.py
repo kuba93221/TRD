@@ -52,7 +52,6 @@ def health_check():
 # =========================================================================
 @app.route('/test-auth', methods=['GET'])
 def web_test_okx_handshake():
-    """Weryfikacja autoryzacji na europejskim klastrze OKX (eea.okx.com)."""
     import urllib.error
     import time
 
@@ -60,7 +59,6 @@ def web_test_okx_handshake():
     secret_key = str(os.environ.get("OKX_SECRET_KEY", "")).strip()
     passphrase = str(os.environ.get("OKX_PASSPHRASE", "")).strip()
     
-    # KRYTYCZNA ZMIANA Z TWOJEGO ZRZUTU EKRANU:
     base_url = "https://eea.okx.com" 
     request_path = "/api/v5/account/config"
 
@@ -77,10 +75,8 @@ def web_test_okx_handshake():
         report["error"] = "Brak wymaganych zmiennych w panelu Render!"
         return jsonify(report), 400
 
-    # Używamy standardowego czasu ISO, który OKX preferuje
     timestamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
     
-    # Tylko tryb Demo, skoro łączymy się z kontem Demo na EEA
     message = f"{timestamp}GET{request_path}"
     mac = hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
     signature = base64.b64encode(mac.digest()).decode('utf-8')
@@ -120,11 +116,11 @@ def web_test_okx_handshake():
         })
 
     return jsonify(report), 200
+
 # =========================================================================
 # REGULATOR PRZEPŁYWU SIECIOWEGO (TOKEN BUCKET RATE LIMITER)
 # =========================================================================
 class TokenBucketRateLimiter:
-    """Regulator tokenowy dostosowany do limitów zapytań OKX V5 REST API."""
     def __init__(self, tokens_per_second: float = 4.0, max_capacity: float = 8.0):
         self.rate = tokens_per_second
         self.capacity = max_capacity
@@ -180,7 +176,6 @@ class UpstashRedisTradingBridge:
         try:
             hex_str = msgpack.packb(tick_data, use_bin_type=True).hex()
             
-            # Dodano komendę EXPIRE (7 dni = 604800s) dla ochrony limitu 256MB Upstash
             pipeline_payload = [
                 ["LPUSH", safe_key, hex_str],
                 ["LTRIM", safe_key, "0", str(max_elements - 1)],
@@ -272,22 +267,18 @@ class TelegramThrottledDispatcher:
 # RDZEŃ QUANT: Z-SCORE + FILTRY TRENDU MACRO 1H, RSI I ATR
 # =========================================================================
 class AlgorithmicQuantCore:
-    """Aparat analityczny powrotu do średniej (Mean Reversion) z filtrami momentum."""
-
     @staticmethod
     def _calculate_ema(prices: List[float], period: int = 15) -> float:
-        """Kalkulacja EMA w kolejności ściśle chronologicznej (od najstarszej do najnowszej)."""
         if len(prices) < period:
             return prices[-1] if prices else 0.0
         k = 2.0 / (period + 1.0)
-        ema = sum(prices[:period]) / period  # Inicjalizacja SMA z pierwszego okna
+        ema = sum(prices[:period]) / period 
         for p in prices[period:]:
             ema = (p * k) + (ema * (1.0 - k))
         return ema
 
     @staticmethod
     def _calculate_rsi(prices: List[float], period: int = 14) -> float:
-        """Kalkulacja RSI w ujęciu chronologicznym."""
         if len(prices) < period + 1:
             return 50.0
         
@@ -318,10 +309,9 @@ class AlgorithmicQuantCore:
         if std_dev == 0:
             std_dev = 1e-6
             
-        current_price = prices[0]  # Najświeższy zarejestrowany tick
+        current_price = prices[0] 
         z_score = (current_price - sma) / std_dev
 
-        # Filtr trendu na bazie świec 1H (lub cen tickowych w razie braku świec)
         use_prices = macro_prices if len(macro_prices) >= 15 else list(reversed(prices))
         ema_trend = AlgorithmicQuantCore._calculate_ema(use_prices, period=15)
         trend_direction = "LONG_ONLY" if current_price >= ema_trend else "SHORT_ONLY"
@@ -343,12 +333,30 @@ class AlgorithmicQuantCore:
         }
 
 # =========================================================================
+# ETAP 1: APARAT MATEMATYCZNY MOMENTUM
+# =========================================================================
+class MomentumQuantCore:
+    @staticmethod
+    def calculate_momentum(candles: List[List[str]], period: int = 10) -> Optional[Dict[str, Any]]:
+        if len(candles) < period + 1:
+            return None
+        closes = [float(c[4]) for c in candles]
+        current_price = closes[-1]
+        past_price = closes[-period - 1]
+        if past_price == 0:
+            return None
+        roc = ((current_price - past_price) / past_price) * 100.0
+        return {
+            "roc": round(roc, 2),
+            "current": current_price,
+            "signal": roc > 2.0
+        }
+
+# =========================================================================
 # SYSTEMOWY KLIENT GIEŁDY OKX SPOT (V5 REST API - SANDBOX & PRODUCTION)
 # =========================================================================
 class OKXSpotClient:
-    """Kompletny asynchroniczny klient OKX V5 REST API dla rynku SPOT."""
     def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter, is_sandbox: bool = True):
-        # Aktualizacja URL na europejski klaster OKX (EEA) zgodny z regulacjami
         self.base_url = os.environ.get("OKX_API_URL", "https://eea.okx.com").rstrip('/')
         self.session = session
         self.rate_limiter = rate_limiter
@@ -359,11 +367,9 @@ class OKXSpotClient:
         self.passphrase = os.environ.get("OKX_PASSPHRASE", "").strip()
 
     def _generate_timestamp(self) -> str:
-        """Format ISO 8601 UTC wymagany przez silnik autoryzacji OKX."""
         return datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
     def _sign(self, timestamp: str, method: str, request_path: str, body: str = "") -> str:
-        """Podpis kryptograficzny HMAC-SHA256 zakodowany w formacie Base64."""
         message = f"{timestamp}{method.upper()}{request_path}{body}"
         mac = hmac.new(self.secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
         return base64.b64encode(mac.digest()).decode('utf-8')
@@ -382,7 +388,6 @@ class OKXSpotClient:
         return headers
 
     async def get_account_balance(self, ccy: str = "USDT") -> float:
-        """Pobiera wolne saldo (availBal) z portfela handlowego SPOT z obsługą pauzy autoryzacji."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             logger.warning("[OKX-WARN] Brak pełnych danych uwierzytelniających. Zlecenia wstrzymane (saldo: 0.0).")
             return 0.0
@@ -402,10 +407,8 @@ class OKXSpotClient:
                     for bal in details:
                         if bal.get("ccy") == ccy:
                             return float(bal.get("availBal", 0.0))
-                    # Fallback na ogólną wycenę portfela
                     return float(data["data"][0].get("totalEq", 0.0))
 
-                # Obsługa braku aktywacji klucza w klastrze API
                 if code == "50119":
                     logger.warning("⚠️ [OKX-AUTH-SUSPENDED] Klucz API nie jest aktywny w klastrze Demo. Zlecenia zablokowane (saldo: 0.0).")
                     return 0.0
@@ -417,7 +420,6 @@ class OKXSpotClient:
             return 0.0
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Pobiera kurs instrumentu SPOT (np. 'BTC-USDT')."""
         await self.rate_limiter.consume()
         request_path = f"/api/v5/market/ticker?instId={symbol}"
         url = f"{self.base_url}{request_path}"
@@ -443,7 +445,6 @@ class OKXSpotClient:
             return None
 
     async def get_macro_candles(self, symbol: str, bar: str = "1H", limit: int = 30) -> List[float]:
-        """Pobiera świece historyczne z OKX (kolejność chronologiczna od najstarszej do najnowszej)."""
         await self.rate_limiter.consume()
         request_path = f"/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
         url = f"{self.base_url}{request_path}"
@@ -457,7 +458,6 @@ class OKXSpotClient:
                     return []
                 data = await resp.json()
                 if data.get("code") == "0" and data.get("data"):
-                    # data['data']: [ts, o, h, l, c, vol, ...], od najświeższej do najstarszej
                     candles = data["data"]
                     return [float(c[4]) for c in reversed(candles)]
                 return []
@@ -465,8 +465,27 @@ class OKXSpotClient:
             logger.error(f"[OKX-CANDLES-EXCEPTION] Błąd pobierania świec makro {symbol}: {e}")
             return []
 
+    async def get_macro_candles_raw(self, symbol: str, bar: str = "15m", limit: int = 20) -> List[List[str]]:
+        await self.rate_limiter.consume()
+        request_path = f"/api/v5/market/candles?instId={symbol}&bar={bar}&limit={limit}"
+        url = f"{self.base_url}{request_path}"
+        headers = {"Content-Type": "application/json"}
+        if self.is_sandbox:
+            headers["x-simulated-trading"] = "1"
+
+        try:
+            async with self.session.get(url, headers=headers, timeout=5) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                if data.get("code") == "0" and data.get("data"):
+                    return list(reversed(data["data"]))
+                return []
+        except Exception as e:
+            logger.error(f"[OKX-RAW-CANDLES-EXCEPTION] Błąd pobierania surowych świec {symbol}: {e}")
+            return []
+
     async def execute_market_order(self, symbol: str, side: str, quantity: float) -> Optional[Dict[str, Any]]:
-        """Składa zlecenie rynkowe na rynku SPOT OKX."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None
         await self.rate_limiter.consume()
@@ -474,10 +493,10 @@ class OKXSpotClient:
         request_path = "/api/v5/trade/order"
         body_dict = {
             "instId": symbol,
-            "tdMode": "cash",       # Czysty handel kasowy SPOT bez dźwigni
-            "side": side.lower(),   # 'buy' lub 'sell'
+            "tdMode": "cash",
+            "side": side.lower(),
             "ordType": "market",
-            "sz": str(quantity)     # Wielkość zlecenia
+            "sz": str(quantity)
         }
         body_json = json.dumps(body_dict)
         url = f"{self.base_url}{request_path}"
@@ -491,10 +510,6 @@ class OKXSpotClient:
             return None
 
     async def execute_oco_protection(self, symbol: str, quantity: float, price_tp: float, price_sl: float) -> Optional[Dict[str, Any]]:
-        """
-        Wysyła zlecenie ochronne Algo OCO (Take Profit + Stop Loss) na OKX.
-        Wykorzystuje dedykowany endpoint zasileń warunkowych /api/v5/trade/order-algo.
-        """
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None
         await self.rate_limiter.consume()
@@ -507,9 +522,9 @@ class OKXSpotClient:
             "ordType": "oco",
             "sz": str(quantity),
             "tpTriggerPx": str(price_tp),
-            "tpOrdPx": "-1",               # -1 oznacza realizację po cenie rynkowej po wyzwoleniu TP
+            "tpOrdPx": "-1",
             "slTriggerPx": str(price_sl),
-            "slOrdPx": "-1"                # -1 oznacza realizację po cenie rynkowej po wyzwoleniu SL
+            "slOrdPx": "-1"
         }
         body_json = json.dumps(body_dict)
         url = f"{self.base_url}{request_path}"
@@ -552,13 +567,9 @@ async def run_async_pipeline():
                 session
             )
 
-            # Inicjalizacja klienta OKX (domyślnie Sandbox / Demo Trading)
             okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
             total_balance = await okx_client.get_account_balance("USDT")
 
-            # =========================================================================
-            # KONTROLA LIMITU PORTFELA (MAX 3 OTWARTE POZYCJE ŁĄCZNIE)
-            # =========================================================================
             try:
                 url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
                 async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
@@ -573,7 +584,6 @@ async def run_async_pipeline():
             except Exception as e:
                 logger.error(f"⚠️ [SLOTS CHECK ERROR] Błąd weryfikacji slotów portfela: {e}")
 
-            # Zoptymalizowany koszyk 4 płynnych instrumentów pod takt 3-minutowy (Limit Upstash Free)
             instruments = [
                 {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
                 {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
@@ -585,9 +595,6 @@ async def run_async_pipeline():
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
 
-                # =========================================================================
-                # KONTROLA LIMITU SLOTÓW NA KAŻDY INSTRUMENT (MAX 3 ŁĄCZNIE W PORTFELU)
-                # =========================================================================
                 try:
                     url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
                     async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
@@ -657,9 +664,6 @@ async def run_async_pipeline():
                         calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
                         calculated_qty = max(inst["min_qty"], calculated_qty)
 
-                    # =========================================================================
-                    # WYŁĄCZENIE TRYBU TESTOWEGO - POWRÓT DO CZYSTEJ MATEMATYKI
-                    # =========================================================================
                     FORCE_TEST_EXECUTION = False  
 
                     standard_buy = FORCE_TEST_EXECUTION or (z <= -1.5 and trend == "LONG_ONLY" and rsi <= 35)
@@ -695,14 +699,78 @@ async def run_async_pipeline():
             gc.collect()
 
 # =========================================================================
-# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY
+# ETAP 1: NIEZALEŻNY WORKER MOMENTUM W TLE
+# =========================================================================
+async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_client):
+    logger.info("🚀 [MOMENTUM-WORKER] Uruchomiono niezależny wątek analityczny Momentum w tle.")
+    
+    instruments = [
+        {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_MOM"},
+        {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_MOM"},
+        {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_MOM"},
+        {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_MOM"}
+    ]
+
+    while not ASYNC_SHUTDOWN_EVENT.is_set():
+        try:
+            url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
+            async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
+                active_count = 0
+                if resp_k.status == 200:
+                    data_k = await resp_k.json()
+                    active_count = len(data_k.get("result", []))
+            
+            if active_count >= 3:
+                await asyncio.sleep(60)
+                continue
+
+            for inst in instruments:
+                if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
+                    break
+                
+                candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=20)
+                mom_metrics = MomentumQuantCore.calculate_momentum(candles_raw, period=10)
+                
+                if mom_metrics and mom_metrics["signal"]:
+                    logger.info(f"🚀 [MOMENTUM-SIGNAL] Silny impuls dla {inst['label']} | ROC: {mom_metrics['roc']}%")
+                    
+        except Exception as e:
+            logger.error(f"❌ [MOMENTUM-ERROR] Błąd w workerze Momentum: {e}")
+        
+        await asyncio.sleep(300)
+
+# =========================================================================
+# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON)
 # =========================================================================
 async def continuous_async_cron(loop):
-    global ASYNC_SHUTDOWN_EVENT
-    logger.info("⚡ [TRADING ONLINE] Silnik OKX gotowy do wyzwalania zewnętrznego przez endpoint.")
+    global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER
+    logger.info("⚡ [TRADING MULTI-TASKING ONLINE] Uruchamianie niezależnych workerów w tle...")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
-    while not ASYNC_SHUTDOWN_EVENT.is_set():
-        await asyncio.sleep(1)
+    if RATE_LIMITER is None:
+        RATE_LIMITER = TokenBucketRateLimiter()
+
+    async with aiohttp.ClientSession() as session:
+        redis_trade = UpstashRedisTradingBridge(
+            os.environ.get("UPSTASH_REDIS_REST_URL", ""),
+            os.environ.get("UPSTASH_REDIS_REST_TOKEN", ""),
+            session
+        )
+        tg = TelegramThrottledDispatcher(
+            os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            os.environ.get("TELEGRAM_CHANNEL_ID", ""),
+            session
+        )
+        okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
+
+        # Uruchamiamy niezależne zadania w tle
+        momentum_task = asyncio.create_task(independent_momentum_worker(session, redis_trade, tg, okx_client))
+
+        while not ASYNC_SHUTDOWN_EVENT.is_set():
+            await asyncio.sleep(1)
+
+        momentum_task.cancel()
+        await asyncio.gather(momentum_task, return_exceptions=True)
+
     logger.info("👋 [SHUTDOWN] Potok zamknięty bezpiecznie. Wszystkie stany skonsolidowane.")
 
 def background_scheduler_thread():
@@ -729,7 +797,6 @@ def manual_analysis_trigger():
 
 @app.route('/export-analytics', methods=['GET'])
 def export_analytics_safe_json():
-    """Lekki eksport analityki bez zewnętrznej zależności requests."""
     try:
         r_url = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip('/')
         r_tok = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
