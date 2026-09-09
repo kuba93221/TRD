@@ -388,36 +388,41 @@ class OKXSpotClient:
         return headers
 
     async def get_account_balance(self, ccy: str = "USDT") -> float:
+        """Pobiera wolne saldo z obsługą automatycznego ponowienia (Retry) przy błędach 50001."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             logger.warning("[OKX-WARN] Brak pełnych danych uwierzytelniających. Zlecenia wstrzymane (saldo: 0.0).")
             return 0.0
 
-        await self.rate_limiter.consume()
-        request_path = f"/api/v5/account/balance?ccy={ccy}"
-        url = f"{self.base_url}{request_path}"
-        headers = self._get_headers("GET", request_path)
+        for attempt in range(2): # Dwie próby połączenia
+            await self.rate_limiter.consume()
+            request_path = f"/api/v5/account/balance?ccy={ccy}"
+            url = f"{self.base_url}{request_path}"
+            headers = self._get_headers("GET", request_path)
 
-        try:
-            async with self.session.get(url, headers=headers, timeout=5) as resp:
-                data = await resp.json()
-                code = data.get("code")
+            try:
+                async with self.session.get(url, headers=headers, timeout=5) as resp:
+                    data = await resp.json()
+                    code = data.get("code")
 
-                if code == "0" and data.get("data"):
-                    details = data["data"][0].get("details", [])
-                    for bal in details:
-                        if bal.get("ccy") == ccy:
-                            return float(bal.get("availBal", 0.0))
-                    return float(data["data"][0].get("totalEq", 0.0))
+                    if code == "0" and data.get("data"):
+                        details = data["data"][0].get("details", [])
+                        for bal in details:
+                            if bal.get("ccy") == ccy:
+                                return float(bal.get("availBal", 0.0))
+                        return float(data["data"][0].get("totalEq", 0.0))
 
-                if code == "50119":
-                    logger.warning("⚠️ [OKX-AUTH-SUSPENDED] Klucz API nie jest aktywny w klastrze Demo. Zlecenia zablokowane (saldo: 0.0).")
-                    return 0.0
+                    if code == "50119":
+                        logger.warning("⚠️ [OKX-AUTH-SUSPENDED] Klucz API nie jest aktywny w klastrze Demo.")
+                        return 0.0
 
-                logger.error(f"[OKX-BALANCE-FAIL] Odpowiedź giełdy: code={code}, msg={data.get('msg')}")
-                return 0.0
-        except Exception as e:
-            logger.error(f"[OKX-BALANCE-EXCEPTION] Błąd pobierania salda konta: {e}")
-            return 0.0
+                    logger.warning(f"⚠️ [OKX-BALANCE-RETRY] Próba {attempt+1}/2 nie powiodła się: code={code}, msg={data.get('msg')}")
+                    await asyncio.sleep(1.0)
+            except Exception as e:
+                logger.error(f"❌ [OKX-BALANCE-EXCEPTION] Wyjątek w próbie {attempt+1}: {e}")
+                await asyncio.sleep(1.0)
+
+        logger.error("[OKX-BALANCE-FAIL] Giełda OKX uporczywie odmawia podania salda. Zlecenia wstrzymane w tym cyklu.")
+        return 0.0
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         await self.rate_limiter.consume()
