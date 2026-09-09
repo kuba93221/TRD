@@ -552,9 +552,26 @@ async def run_async_pipeline():
                 session
             )
 
-           # Inicjalizacja klienta OKX (domyślnie Sandbox / Demo Trading)
+            # Inicjalizacja klienta OKX (domyślnie Sandbox / Demo Trading)
             okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
             total_balance = await okx_client.get_account_balance("USDT")
+
+            # =========================================================================
+            # KONTROLA LIMITU PORTFELA (MAX 3 OTWARTE POZYCJE ŁĄCZNIE)
+            # =========================================================================
+            try:
+                url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
+                async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
+                    global_active_count = 0
+                    if resp_k.status == 200:
+                        data_k = await resp_k.json()
+                        global_active_count = len(data_k.get("result", []))
+                
+                if global_active_count >= 3:
+                    logger.info(f"🛡️ [PORTFOLIO LIMIT] Osiągnięto limit 3 otwartych pozycji. Wstrzymujemy nowe wejścia w tym cyklu.")
+                    return
+            except Exception as e:
+                logger.error(f"⚠️ [SLOTS CHECK ERROR] Błąd weryfikacji slotów portfela: {e}")
 
             # Zoptymalizowany koszyk 4 płynnych instrumentów pod takt 3-minutowy (Limit Upstash Free)
             instruments = [
@@ -642,6 +659,9 @@ async def run_async_pipeline():
                             # Aktywacja obrony OCO po rozliczeniu zakupu
                             await asyncio.sleep(0.3)
                             await inst["client"].execute_oco_protection(inst["symbol"], actual_qty, price_tp, price_sl)
+                            
+                            # Oznaczenie aktywnej pozycji w Redis (dla kontroli limitu slotów)
+                            await redis_trade.push_historical_tick(f"POS_ACTIVE:{inst['label']}", {"status": "OPEN", "time": time.time()}, max_elements=1)
 
                             await tg.push(
                                 f"🟩 <b>[OKX TRADING ENGINE: OCO DEPLOYED]</b>\n"
