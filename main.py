@@ -609,56 +609,57 @@ async def run_async_pipeline():
                     logger.info(f"📊 [{inst['label']}] P: {current_price} | Z: {z} | RSI: {rsi} | Bw: {bandwidth} | T: {trend}")
                     await redis_trade.incr_metric(f"ticks_{inst['label']}")
 
+                    # Filtr zmienności: odrzucenie martwej konsolidacji
                     if bandwidth < 0.001:
                         logger.info(f"⚠️ [{inst['label']}] Blokada: BandWidth skrajnie niski ({bandwidth}). Rynek w kompresji.")
                         continue
 
-                        # Zarządzanie ryzykiem: 1% salda kapitału
-                        risk_capital = total_balance * 0.01
-                        stop_loss_distance = atr * 2.0
+                    # Zarządzanie ryzykiem: 1% salda kapitału
+                    risk_capital = total_balance * 0.01
+                    stop_loss_distance = atr * 2.0
 
-                        if stop_loss_distance > 0:
-                            calculated_qty = risk_capital / stop_loss_distance
-                            calculated_qty = max(inst["min_qty"], round(calculated_qty, inst["round_digits"]))
-                        else:
-                            calculated_qty = inst["min_qty"]
+                    if stop_loss_distance > 0:
+                        calculated_qty = risk_capital / stop_loss_distance
+                        calculated_qty = max(inst["min_qty"], round(calculated_qty, inst["round_digits"]))
+                    else:
+                        calculated_qty = inst["min_qty"]
 
-                        # Wymóg minimalnej wartości zlecenia OKX (> 11 USDT)
-                        order_value_usdt = calculated_qty * current_price
-                        if order_value_usdt < 11.0:
-                            calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
-                            calculated_qty = max(inst["min_qty"], calculated_qty)
+                    # Wymóg minimalnej wartości zlecenia OKX (> 11 USDT)
+                    order_value_usdt = calculated_qty * current_price
+                    if order_value_usdt < 11.0:
+                        calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
+                        calculated_qty = max(inst["min_qty"], calculated_qty)
 
-                        # Decyzja wejścia: Standardowe odbicie lub wyprzedaż krachowa
-                        standard_buy = (z <= -1.5 and trend == "LONG_ONLY" and rsi <= 35)
-                        crash_buy = (z <= -2.5 and rsi <= 20)
+                    # Decyzja wejścia: Standardowe odbicie lub wyprzedaż krachowa
+                    standard_buy = (z <= -1.5 and trend == "LONG_ONLY" and rsi <= 35)
+                    crash_buy = (z <= -2.5 and rsi <= 20)
 
-                        if standard_buy or crash_buy:
-                            logger.info(f"🚨 [EXECUTION-TRIGGER] Kupno SPOT dla {inst['label']} (Standard: {standard_buy}, Crash: {crash_buy})")
-                            order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
+                    if standard_buy or crash_buy:
+                        logger.info(f"🚨 [EXECUTION-TRIGGER] Kupno SPOT dla {inst['label']} (Standard: {standard_buy}, Crash: {crash_buy})")
+                        order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
 
-                            if order_res and order_res.get("code") == "0":
-                                actual_qty = calculated_qty
-                                price_tp = round(current_price + (stop_loss_distance * 1.5), inst["price_round"])
-                                price_sl = round(current_price - stop_loss_distance, inst["price_round"])
+                        if order_res and order_res.get("code") == "0":
+                            actual_qty = calculated_qty
+                            price_tp = round(current_price + (stop_loss_distance * 1.5), inst["price_round"])
+                            price_sl = round(current_price - stop_loss_distance, inst["price_round"])
 
-                                # Aktywacja obrony OCO po rozliczeniu zakupu
-                                await asyncio.sleep(0.3)
-                                await inst["client"].execute_oco_protection(inst["symbol"], actual_qty, price_tp, price_sl)
+                            # Aktywacja obrony OCO po rozliczeniu zakupu
+                            await asyncio.sleep(0.3)
+                            await inst["client"].execute_oco_protection(inst["symbol"], actual_qty, price_tp, price_sl)
 
-                                await tg.push(
-                                    f"🟩 <b>[OKX TRADING ENGINE: OCO DEPLOYED]</b>\n"
-                                    f"──────────────────────────────\n"
-                                    f"🤖 Tryb: <b>SPOT (Demo Sandbox)</b>\n"
-                                    f"📈 Instrument: <b>{inst['label']}</b>\n"
-                                    f"💰 Kurs wejścia: <b>{current_price} USDT</b>\n"
-                                    f"📦 Wielkość: <b>{actual_qty}</b> (Ryzyko: 1% konta)\n"
-                                    f"──────────────────────────────\n"
-                                    f"🛡️ <b>OCHRONA OCO (ALGO):</b>\n"
-                                    f"  • 🎯 Take Profit: <code>{price_tp} USDT</code>\n"
-                                    f"  • 🛑 Stop Loss: <code>{price_sl} USDT</code>\n"
-                                    f"──────────────────────────────"
-                                )
+                            await tg.push(
+                                f"🟩 <b>[OKX TRADING ENGINE: OCO DEPLOYED]</b>\n"
+                                f"──────────────────────────────\n"
+                                f"🤖 Tryb: <b>SPOT (Demo Sandbox)</b>\n"
+                                f"📈 Instrument: <b>{inst['label']}</b>\n"
+                                f"💰 Kurs wejścia: <b>{current_price} USDT</b>\n"
+                                f"📦 Wielkość: <b>{actual_qty}</b> (Ryzyko: 1% konta)\n"
+                                f"──────────────────────────────\n"
+                                f"🛡️ <b>OCHRONA OCO (ALGO):</b>\n"
+                                f"  • 🎯 Take Profit: <code>{price_tp} USDT</code>\n"
+                                f"  • 🛑 Stop Loss: <code>{price_sl} USDT</code>\n"
+                                f"──────────────────────────────"
+                            )
             gc.collect()
 
 # =========================================================================
