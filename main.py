@@ -856,7 +856,7 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 3: WORKER BREAKOUT W TLE (SYNCHRO 180s + TELEMETRIA)
+# STRATEGIA 3: WORKER BREAKOUT W TLE (POPRAWIONE WCIĘCIA + PEŁNA DIAGNOSTYKA)
 # =========================================================================
 async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("💥 [BREAKOUT-WORKER] Uruchomiono niezależny wątek Breakout w tle.")
@@ -870,15 +870,14 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         try:
+            # 1. Weryfikacja globalnego limitu 3 pozycji
             url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
             async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
-                active_count = 0
-                if resp_k.status == 200:
-                    data_k = await resp_k.json()
-                    active_count = len(data_k.get("result", []))
+                active_keys = (await resp_k.json()).get("result", []) if resp_k.status == 200 else []
+                active_count = len(active_keys)
             
             if active_count >= 3:
-                logger.info("🛡️ [BREAKOUT] Limit 3 pozycji osiągnięty. Worker wstrzymuje skanowanie.")
+                logger.info(f"🛡️ [BREAKOUT] Limit {active_count}/3 pozycji osiągnięty. Worker wstrzymuje skanowanie.")
                 await asyncio.sleep(60)
                 continue
 
@@ -886,6 +885,10 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
                 
+                # 2. Blokada dublowania: pomijamy instrument, jeśli ma już otwartą pozycję Breakout
+                if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
+                    continue
+
                 candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=30)
                 brk_metrics = BreakoutQuantCore.calculate_breakout(candles_raw, period=20)
                 
@@ -900,7 +903,13 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                         risk_capital = total_balance * 0.01
                         calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.025), inst["round_digits"]))
                         
+                        # Zabezpieczenie minimalnej wartości zlecenia (min. 11 USDT)
+                        if (calculated_qty * current_price) < 11.0:
+                            calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
+
                         order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
+                        
+                        # 3. Weryfikacja odpowiedzi z giełdy i raportowanie
                         if order_res and order_res.get("code") == "0":
                             price_tp = round(current_price * 1.04, inst["price_round"])
                             price_sl = round(current_price * 0.98, inst["price_round"])
@@ -912,20 +921,36 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                                 {"status": "OPEN", "type": "BREAKOUT", "time": time.time()}, 
                                 max_elements=1
                             )
+                            active_keys.append(f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}")
+                            
                             await tg_dispatcher.push(
                                 f"💥 <b>[BREAKOUT ENGINE: TRADE DEPLOYED]</b>\n"
                                 f"──────────────────────────────\n"
                                 f"📈 Instrument: <b>{inst['label']}</b> | Bw: <code>{brk_metrics['bandwidth']}</code>\n"
                                 f"💰 Wejście: <b>{current_price} USDT</b>\n"
+                                f"📦 Wielkość: <b>{calculated_qty}</b>\n"
                                 f"🎯 TP (+4%): <code>{price_tp} USDT</code> | 🛑 SL (-2%): <code>{price_sl} USDT</code>"
+                            )
+                        else:
+                            err_code = order_res.get("code") if order_res else "BRAK_ODPOWIEDZI"
+                            err_msg = order_res.get("msg") if order_res else "Timeout lub błąd połączenia"
+                            
+                            logger.error(f"❌ [BREAKOUT-REJECTED] Odrzucono zlecenie dla {inst['label']}! Kod: {err_code} | Komunikat: {err_msg}")
+                            
+                            await tg_dispatcher.push(
+                                f"⚠️ <b>[BREAKOUT: ZLECENIE ODRZUCONE PRZEZ OKX]</b>\n"
+                                f"Instrument: <b>{inst['label']}</b>\n"
+                                f"Kod błędu: <code>{err_code}</code>\n"
+                                f"Powód: <i>{err_msg}</i>"
                             )
         except Exception as e:
             logger.error(f"❌ [BREAKOUT-ERROR] Błąd w workerze Breakout: {e}")
         
+        # Prawidłowe wcięcie: uśpienie całego cyklu workera na 180 sekund
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 4: WORKER GRID TRADING W TLE (ETAP 3 - SIATKA KONSOLIDACJI)
+# STRATEGIA 4: WORKER GRID TRADING (POPRAWKA: BLOKADA DUBLI I FORMATOWANIE CENY)
 # =========================================================================
 async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🧱 [GRID-WORKER] Uruchomiono niezależny wątek Grid Trading w tle.")
@@ -939,15 +964,14 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         try:
+            # 1. Globalna weryfikacja limitu 3 pozycji
             url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
             async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
-                active_count = 0
-                if resp_k.status == 200:
-                    data_k = await resp_k.json()
-                    active_count = len(data_k.get("result", []))
+                active_keys = (await resp_k.json()).get("result", []) if resp_k.status == 200 else []
+                active_count = len(active_keys)
             
             if active_count >= 3:
-                logger.info("🛡️ [GRID] Limit 3 pozycji osiągnięty. Worker wstrzymuje skanowanie.")
+                logger.info(f"🛡️ [GRID] Limit {active_count}/3 pozycji osiągnięty. Worker czeka.")
                 await asyncio.sleep(60)
                 continue
 
@@ -955,40 +979,60 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
                 
+                # 2. Idempotency Lock: Pomijamy instrument, jeśli ten Grid już ma otwartą pozycję
+                if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
+                    logger.debug(f"⏳ [GRID-HOLD] Pozycja dla {inst['label']} jest już aktywna. Pomijam.")
+                    continue
+
                 candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=30)
                 grid_metrics = GridQuantCore.calculate_grid_levels(candles_raw, grid_step_pct=0.005, levels=3)
                 
                 if grid_metrics:
-                    cur_p = grid_metrics["current_price"]
-                    logger.info(f"🧱 [GRID-SCAN] {inst['label']} | ATR: {grid_metrics['atr_pct']}% (0.2-0.8) | ROC: {grid_metrics['roc']}% | Konsolidacja: {grid_metrics['is_consolidation']}")
+                    logger.info(f"🧱 [GRID-SCAN] {inst['label']} | ATR: {grid_metrics['atr_pct']}% | ROC: {grid_metrics['roc']}% | Konsolidacja: {grid_metrics['is_consolidation']}")
                     
                     if grid_metrics["is_consolidation"]:
                         first_level = grid_metrics["levels"][0]
-                        price_buy = first_level["buy_price"]
-                        price_tp = first_level["tp_price"]
+                        
+                        # Rygorystyczne zaokrąglenie ceny pod specyfikację giełdy
+                        price_buy = round(first_level["buy_price"], inst["price_round"])
+                        price_tp = round(first_level["tp_price"], inst["price_round"])
                         
                         total_balance = await inst["client"].get_account_balance("USDT")
                         risk_capital = total_balance * 0.01
-                        calculated_qty = max(inst["min_qty"], round(risk_capital / price_buy, inst["round_digits"]))
                         
-                        logger.info(f"🚨 [GRID-TRIGGER] Konsolidacja boczna wykryta dla {inst['label']}. Rozstawianie drabinki.")
+                        # Weryfikacja minimalnej wartości zlecenia (min. 11 USDT dla OKX)
+                        calculated_qty = max(inst["min_qty"], round(risk_capital / price_buy, inst["round_digits"]))
+                        if (calculated_qty * price_buy) < 11.0:
+                            calculated_qty = max(calculated_qty, round(11.0 / price_buy, inst["round_digits"]))
+
+                        logger.info(f"🚨 [GRID-TRIGGER] Składanie zlecenia Limit dla {inst['label']} | Cena: {price_buy} | Ilość: {calculated_qty}")
                         order_res = await inst["client"].execute_limit_order(inst["symbol"], "buy", calculated_qty, price_buy)
                         
+                        # 3. Pełna telemetria odpowiedzi z OKX
                         if order_res and order_res.get("code") == "0":
                             price_sl = round(price_buy * 0.985, inst["price_round"])
                             await redis_trade.push_historical_tick(
                                 f"POS_ACTIVE:{inst['label']}", 
-                                {"status": "OPEN", "type": "GRID", "time": time.time()}, 
+                                {"status": "OPEN", "type": "GRID", "order_id": order_res["data"][0]["ordId"], "time": time.time()}, 
                                 max_elements=1
                             )
+                            # Odświeżamy listę aktywnych kluczy w locie
+                            active_keys.append(f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}")
+                            
                             await tg_dispatcher.push(
                                 f"🧱 <b>[GRID ENGINE: LIMIT ORDER PLACED]</b>\n"
                                 f"──────────────────────────────\n"
                                 f"📈 Instrument: <b>{inst['label']}</b>\n"
                                 f"📥 Kupno (Limit L1): <b>{price_buy} USDT</b>\n"
+                                f"📦 Wielkość: <b>{calculated_qty}</b>\n"
                                 f"🎯 Take Profit: <code>{price_tp} USDT</code> (+0.5%)\n"
                                 f"🛑 Stop Loss: <code>{price_sl} USDT</code> (-1.5%)"
                             )
+                        else:
+                            error_msg = order_res.get("msg") if order_res else "Brak odpowiedzi HTTP"
+                            error_code = order_res.get("code") if order_res else "CONN_ERR"
+                            logger.error(f"❌ [GRID-ORDER-REJECTED] Błąd zlecenia {inst['label']}: Code {error_code} -> {error_msg}")
+
         except Exception as e:
             logger.error(f"❌ [GRID-ERROR] Błąd w workerze Grid: {e}")
             
