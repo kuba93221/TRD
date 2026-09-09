@@ -53,7 +53,6 @@ def health_check():
 @app.route('/test-auth', methods=['GET'])
 def web_test_okx_handshake():
     import urllib.error
-    import time
 
     api_key = str(os.environ.get("OKX_API_KEY", "")).strip()
     secret_key = str(os.environ.get("OKX_SECRET_KEY", "")).strip()
@@ -264,7 +263,7 @@ class TelegramThrottledDispatcher:
             pass
 
 # =========================================================================
-# RDZEŃ QUANT: Z-SCORE + FILTRY TRENDU MACRO 1H, RSI I ATR
+# RDZEŃ QUANT 1: MEAN REVERSION (Z-SCORE + EMA 1H + RSI + ATR)
 # =========================================================================
 class AlgorithmicQuantCore:
     @staticmethod
@@ -333,7 +332,7 @@ class AlgorithmicQuantCore:
         }
 
 # =========================================================================
-# ETAP 1: APARAT MATEMATYCZNY MOMENTUM
+# RDZEŃ QUANT 2: MOMENTUM (ROC TREND FOLLOWING)
 # =========================================================================
 class MomentumQuantCore:
     @staticmethod
@@ -350,6 +349,34 @@ class MomentumQuantCore:
             "roc": round(roc, 2),
             "current": current_price,
             "signal": roc > 2.0
+        }
+
+# =========================================================================
+# RDZEŃ QUANT 3: BREAKOUT (BOLLINGER COMPRESSION + SQUEEZE)
+# =========================================================================
+class BreakoutQuantCore:
+    @staticmethod
+    def calculate_breakout(candles: List[List[str]], period: int = 20) -> Optional[Dict[str, Any]]:
+        if len(candles) < period:
+            return None
+        closes = [float(c[4]) for c in candles]
+        current_price = closes[-1]
+        
+        sma = sum(closes[-period:]) / period
+        variance = sum((x - sma) ** 2 for x in closes[-period:]) / period
+        std_dev = math.sqrt(variance) if variance > 0 else 1e-6
+        
+        upper_band = sma + (2.0 * std_dev)
+        lower_band = sma - (2.0 * std_dev)
+        bandwidth = (upper_band - lower_band) / sma if sma > 0 else 0.0
+        
+        is_compression = bandwidth < 0.015
+        is_breakout_up = current_price > upper_band
+        
+        return {
+            "bandwidth": round(bandwidth, 4),
+            "upper_band": round(upper_band, 4),
+            "signal": is_compression and is_breakout_up
         }
 
 # =========================================================================
@@ -388,7 +415,6 @@ class OKXSpotClient:
         return headers
 
     async def get_account_balance(self, ccy: str = "USDT") -> float:
-        """Pobiera wolne saldo z bezpiecznym fallbackiem dla trybu Sandbox (zapobiega blokadzie przy 50001)."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             logger.warning("[OKX-WARN] Brak pełnych danych uwierzytelniających. Używam salda testowego 1000.0 USDT.")
             return 1000.0 if self.is_sandbox else 0.0
@@ -539,7 +565,7 @@ class OKXSpotClient:
             return None
 
 # =========================================================================
-# CENTRALNY ASYNCHRONICZNY POTOK WYKONAWCZY (OKX SPOT ENGINE)
+# STRATEGIA 1: CENTRALNY POTOK POWROTU DO ŚREDNIEJ (MEAN REVERSION)
 # =========================================================================
 async def run_async_pipeline():
     global RATE_LIMITER, PIPELINE_LOCK
@@ -578,7 +604,7 @@ async def run_async_pipeline():
                         global_active_count = len(data_k.get("result", []))
                 
                 if global_active_count >= 3:
-                    logger.info(f"🛡️ [PORTFOLIO LIMIT] Osiągnięto limit 3 otwartych pozycji. Wstrzymujemy nowe wejścia w tym cyklu.")
+                    logger.info("🛡️ [PORTFOLIO LIMIT] Osiągnięto limit 3 otwartych pozycji. Wstrzymujemy nowe wejścia w tym cyklu.")
                     return
             except Exception as e:
                 logger.error(f"⚠️ [SLOTS CHECK ERROR] Błąd weryfikacji slotów portfela: {e}")
@@ -680,12 +706,16 @@ async def run_async_pipeline():
                             await asyncio.sleep(0.3)
                             await inst["client"].execute_oco_protection(inst["symbol"], actual_qty, price_tp, price_sl)
                             
-                            await redis_trade.push_historical_tick(f"POS_ACTIVE:{inst['label']}", {"status": "OPEN", "time": time.time()}, max_elements=1)
+                            await redis_trade.push_historical_tick(
+                                f"POS_ACTIVE:{inst['label']}", 
+                                {"status": "OPEN", "type": "MEAN_REVERSION", "time": time.time()}, 
+                                max_elements=1
+                            )
 
                             await tg.push(
                                 f"🟩 <b>[OKX TRADING ENGINE: OCO DEPLOYED]</b>\n"
                                 f"──────────────────────────────\n"
-                                f"🤖 Tryb: <b>SPOT (Demo Sandbox)</b>\n"
+                                f"🤖 Tryb: <b>SPOT (Mean Reversion)</b>\n"
                                 f"📈 Instrument: <b>{inst['label']}</b>\n"
                                 f"💰 Kurs wejścia: <b>{current_price} USDT</b>\n"
                                 f"📦 Wielkość: <b>{actual_qty}</b> (Ryzyko: 1% konta)\n"
@@ -698,7 +728,7 @@ async def run_async_pipeline():
             gc.collect()
 
 # =========================================================================
-# ETAP 1: NIEZALEŻNY WORKER MOMENTUM W TLE (POPRAWIONY SKŁADNIOWO)
+# STRATEGIA 2: WORKER MOMENTUM W TLE
 # =========================================================================
 async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🚀 [MOMENTUM-WORKER] Uruchomiono niezależny wątek analityczny Momentum w tle.")
@@ -747,12 +777,18 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                         
                         await asyncio.sleep(0.3)
                         await inst["client"].execute_oco_protection(inst["symbol"], calculated_qty, price_tp, price_sl)
-                        await redis_trade.push_historical_tick(f"POS_ACTIVE:{inst['label']}", {"status": "OPEN", "type": "MOMENTUM", "time": time.time()}, max_elements=1)
+                        await redis_trade.push_historical_tick(
+                            f"POS_ACTIVE:{inst['label']}", 
+                            {"status": "OPEN", "type": "MOMENTUM", "time": time.time()}, 
+                            max_elements=1
+                        )
                         
                         await tg_dispatcher.push(
                             f"🚀 <b>[MOMENTUM ENGINE: TRADE DEPLOYED]</b>\n"
+                            f"──────────────────────────────\n"
                             f"📈 Instrument: <b>{inst['label']}</b> | ROC: <code>{mom_metrics['roc']}%</code>\n"
-                            f"💰 Wejście: <b>{current_price} USDT</b>"
+                            f"💰 Wejście: <b>{current_price} USDT</b>\n"
+                            f"🎯 TP (+3%): <code>{price_tp} USDT</code> | 🛑 SL (-2%): <code>{price_sl} USDT</code>"
                         )
                         
         except Exception as e:
@@ -761,11 +797,76 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
         await asyncio.sleep(300)
 
 # =========================================================================
-# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - CLEAN)
+# STRATEGIA 3: WORKER BREAKOUT W TLE
+# =========================================================================
+async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_client):
+    logger.info("💥 [BREAKOUT-WORKER] Uruchomiono niezależny wątek Breakout w tle.")
+    
+    instruments = [
+        {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_BRK", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
+        {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_BRK", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
+        {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_BRK", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
+        {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_BRK", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+    ]
+
+    while not ASYNC_SHUTDOWN_EVENT.is_set():
+        try:
+            url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
+            async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
+                active_count = 0
+                if resp_k.status == 200:
+                    data_k = await resp_k.json()
+                    active_count = len(data_k.get("result", []))
+            
+            if active_count >= 3:
+                await asyncio.sleep(60)
+                continue
+
+            for inst in instruments:
+                if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
+                    break
+                
+                candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=30)
+                brk_metrics = BreakoutQuantCore.calculate_breakout(candles_raw, period=20)
+                
+                if brk_metrics and brk_metrics["signal"]:
+                    logger.info(f"💥 [BREAKOUT-SIGNAL] Wykryto wybicie dla {inst['label']} | Bw: {brk_metrics['bandwidth']}")
+                    current_price = float(candles_raw[-1][4])
+                    total_balance = await inst["client"].get_account_balance("USDT")
+                    
+                    risk_capital = total_balance * 0.01
+                    calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.025), inst["round_digits"]))
+                    
+                    order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
+                    if order_res and order_res.get("code") == "0":
+                        price_tp = round(current_price * 1.04, inst["price_round"])
+                        price_sl = round(current_price * 0.98, inst["price_round"])
+                        
+                        await asyncio.sleep(0.3)
+                        await inst["client"].execute_oco_protection(inst["symbol"], calculated_qty, price_tp, price_sl)
+                        await redis_trade.push_historical_tick(
+                            f"POS_ACTIVE:{inst['label']}", 
+                            {"status": "OPEN", "type": "BREAKOUT", "time": time.time()}, 
+                            max_elements=1
+                        )
+                        await tg_dispatcher.push(
+                            f"💥 <b>[BREAKOUT ENGINE: TRADE DEPLOYED]</b>\n"
+                            f"──────────────────────────────\n"
+                            f"📈 Instrument: <b>{inst['label']}</b> | Bw: <code>{brk_metrics['bandwidth']}</code>\n"
+                            f"💰 Wejście: <b>{current_price} USDT</b>\n"
+                            f"🎯 TP (+4%): <code>{price_tp} USDT</code> | 🛑 SL (-2%): <code>{price_sl} USDT</code>"
+                        )
+        except Exception as e:
+            logger.error(f"❌ [BREAKOUT-ERROR] Błąd w workerze Breakout: {e}")
+        
+        await asyncio.sleep(300)
+
+# =========================================================================
+# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - 3 STRATEGIE)
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER
-    logger.info("⚡ [TRADING MULTI-TASKING ONLINE] Uruchamianie niezależnych workerów w tle...")
+    logger.info("⚡ [TRADING MULTI-TASKING ONLINE] Uruchamianie workerów tła (Momentum + Breakout)...")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
     if RATE_LIMITER is None:
         RATE_LIMITER = TokenBucketRateLimiter()
@@ -784,8 +885,10 @@ async def continuous_async_cron(loop):
         okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
 
         momentum_task = None
+        breakout_task = None
         try:
             momentum_task = asyncio.create_task(independent_momentum_worker(session, redis_trade, tg, okx_client))
+            breakout_task = asyncio.create_task(independent_breakout_worker(session, redis_trade, tg, okx_client))
 
             while not ASYNC_SHUTDOWN_EVENT.is_set():
                 await asyncio.sleep(1)
@@ -793,11 +896,14 @@ async def continuous_async_cron(loop):
         except Exception as e:
             logger.error(f"❌ [CRON-LOOP-ERROR] Krytyczny błąd w pętli wielozadaniowej: {e}")
         finally:
-            if momentum_task:
-                momentum_task.cancel()
-                await asyncio.gather(momentum_task, return_exceptions=True)
+            tasks = [t for t in [momentum_task, breakout_task] if t]
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     logger.info("👋 [SHUTDOWN] Potok zamknięty bezpiecznie. Wszystkie stany skonsolidowane.")
+
 def background_scheduler_thread():
     global BACKGROUND_LOOP
     loop = asyncio.new_event_loop()
