@@ -15,7 +15,6 @@ import base64
 from datetime import datetime, UTC
 from flask import Flask, jsonify
 from typing import Dict, Any, List, Optional
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 # =========================================================================
@@ -75,7 +74,6 @@ def web_test_okx_handshake():
         return jsonify(report), 400
 
     timestamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-    
     message = f"{timestamp}GET{request_path}"
     mac = hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
     signature = base64.b64encode(mac.digest()).decode('utf-8')
@@ -174,30 +172,25 @@ class UpstashRedisTradingBridge:
         safe_key = self._enforce_prefix(f"HISTORY:{market_id}")
         try:
             hex_str = msgpack.packb(tick_data, use_bin_type=True).hex()
-            
             pipeline_payload = [
                 ["LPUSH", safe_key, hex_str],
                 ["LTRIM", safe_key, "0", str(max_elements - 1)],
                 ["LRANGE", safe_key, "0", str(max_elements - 1)],
                 ["EXPIRE", safe_key, "604800"]
             ]
-            
             url = f"{self.url}/pipeline"
             async with self.session.post(url, json=pipeline_payload, headers=self.headers, timeout=5) as resp:
                 if resp.status != 200:
                     return False
-                
                 results = await resp.json()
                 if isinstance(results, list) and len(results) >= 3:
                     cmd_res = results[2]
                     hex_list = cmd_res.get("result", []) if isinstance(cmd_res, dict) else []
-                    
                     parsed_ticks = []
                     for h in hex_list:
                         unpacked = self._safe_unpack_hex(h)
                         if unpacked:
                             parsed_ticks.append(unpacked)
-                            
                     self._pipeline_cache[market_id] = parsed_ticks
                     return True
                 return False
@@ -220,7 +213,6 @@ class UpstashRedisTradingBridge:
                     return []
                 res_json = await response.json()
                 hex_list = res_json.get("result", []) if isinstance(res_json, dict) else []
-                
                 parsed_ticks = []
                 for h in hex_list:
                     unpacked = self._safe_unpack_hex(h)
@@ -280,7 +272,6 @@ class AlgorithmicQuantCore:
     def _calculate_rsi(prices: List[float], period: int = 14) -> float:
         if len(prices) < period + 1:
             return 50.0
-        
         gains = 0.0
         losses = 0.0
         for i in range(1, period + 1):
@@ -289,7 +280,6 @@ class AlgorithmicQuantCore:
                 gains += change
             else:
                 losses -= change
-                
         if losses == 0.0:
             return 100.0
         rs = (gains / period) / (losses / period)
@@ -428,7 +418,6 @@ class OKXSpotClient:
             async with self.session.get(url, headers=headers, timeout=5) as resp:
                 data = await resp.json()
                 code = data.get("code")
-
                 if code == "0" and data.get("data"):
                     details = data["data"][0].get("details", [])
                     for bal in details:
@@ -635,7 +624,6 @@ async def run_async_pipeline():
                     logger.error(f"⚠️ [SLOTS CHECK ERROR] Błąd weryfikacji slotów: {e}")
 
                 ticker = await inst["client"].get_market_ticker(inst["symbol"])
-
                 if not ticker:
                     logger.warning(f"⚠️ [{inst['label']}] Brak odpowiedzi z giełdy dla kursu SPOT.")
                     continue
@@ -677,12 +665,7 @@ async def run_async_pipeline():
 
                     risk_capital = total_balance * 0.01
                     stop_loss_distance = atr * 2.0
-
-                    if stop_loss_distance > 0:
-                        calculated_qty = risk_capital / stop_loss_distance
-                        calculated_qty = max(inst["min_qty"], round(calculated_qty, inst["round_digits"]))
-                    else:
-                        calculated_qty = inst["min_qty"]
+                    calculated_qty = max(inst["min_qty"], round(risk_capital / stop_loss_distance, inst["round_digits"])) if stop_loss_distance > 0 else inst["min_qty"]
 
                     order_value_usdt = calculated_qty * current_price
                     if order_value_usdt < 11.0:
@@ -690,7 +673,6 @@ async def run_async_pipeline():
                         calculated_qty = max(inst["min_qty"], calculated_qty)
 
                     FORCE_TEST_EXECUTION = False  
-
                     standard_buy = FORCE_TEST_EXECUTION or (z <= -1.5 and trend == "LONG_ONLY" and rsi <= 35)
                     crash_buy = (z <= -2.5 and rsi <= 20)
 
@@ -705,7 +687,6 @@ async def run_async_pipeline():
 
                             await asyncio.sleep(0.3)
                             await inst["client"].execute_oco_protection(inst["symbol"], actual_qty, price_tp, price_sl)
-                            
                             await redis_trade.push_historical_tick(
                                 f"POS_ACTIVE:{inst['label']}", 
                                 {"status": "OPEN", "type": "MEAN_REVERSION", "time": time.time()}, 
@@ -728,7 +709,7 @@ async def run_async_pipeline():
             gc.collect()
 
 # =========================================================================
-# STRATEGIA 2: WORKER MOMENTUM W TLE
+# STRATEGIA 2: WORKER MOMENTUM W TLE (SYNCHRO 180s + TELEMETRIA)
 # =========================================================================
 async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🚀 [MOMENTUM-WORKER] Uruchomiono niezależny wątek analityczny Momentum w tle.")
@@ -750,6 +731,7 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                     active_count = len(data_k.get("result", []))
             
             if active_count >= 3:
+                logger.info("🛡️ [MOMENTUM] Limit 3 pozycji osiągnięty. Worker wstrzymuje skanowanie.")
                 await asyncio.sleep(60)
                 continue
 
@@ -760,44 +742,44 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                 candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=20)
                 mom_metrics = MomentumQuantCore.calculate_momentum(candles_raw, period=10)
                 
-                if mom_metrics and mom_metrics["signal"]:
-                    logger.info(f"🚀 [MOMENTUM-SIGNAL] Silny impuls dla {inst['label']} | ROC: {mom_metrics['roc']}%")
+                if mom_metrics:
+                    logger.info(f"📈 [MOMENTUM-SCAN] {inst['label']} | ROC: {mom_metrics['roc']}% (Próg: > +2.0%) | P: {mom_metrics['current']}")
                     
-                    current_price = mom_metrics["current"]
-                    total_balance = await inst["client"].get_account_balance("USDT")
-                    
-                    risk_capital = total_balance * 0.01
-                    calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.02), inst["round_digits"]))
-                    
-                    order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
-                    
-                    if order_res and order_res.get("code") == "0":
-                        price_tp = round(current_price * 1.03, inst["price_round"])
-                        price_sl = round(current_price * 0.98, inst["price_round"])
+                    if mom_metrics["signal"]:
+                        logger.info(f"🚨 [MOMENTUM-TRIGGER] Spełniono warunek impulsu dla {inst['label']}!")
+                        current_price = mom_metrics["current"]
+                        total_balance = await inst["client"].get_account_balance("USDT")
                         
-                        await asyncio.sleep(0.3)
-                        await inst["client"].execute_oco_protection(inst["symbol"], calculated_qty, price_tp, price_sl)
-                        await redis_trade.push_historical_tick(
-                            f"POS_ACTIVE:{inst['label']}", 
-                            {"status": "OPEN", "type": "MOMENTUM", "time": time.time()}, 
-                            max_elements=1
-                        )
+                        risk_capital = total_balance * 0.01
+                        calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.02), inst["round_digits"]))
                         
-                        await tg_dispatcher.push(
-                            f"🚀 <b>[MOMENTUM ENGINE: TRADE DEPLOYED]</b>\n"
-                            f"──────────────────────────────\n"
-                            f"📈 Instrument: <b>{inst['label']}</b> | ROC: <code>{mom_metrics['roc']}%</code>\n"
-                            f"💰 Wejście: <b>{current_price} USDT</b>\n"
-                            f"🎯 TP (+3%): <code>{price_tp} USDT</code> | 🛑 SL (-2%): <code>{price_sl} USDT</code>"
-                        )
-                        
+                        order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
+                        if order_res and order_res.get("code") == "0":
+                            price_tp = round(current_price * 1.03, inst["price_round"])
+                            price_sl = round(current_price * 0.98, inst["price_round"])
+                            
+                            await asyncio.sleep(0.3)
+                            await inst["client"].execute_oco_protection(inst["symbol"], calculated_qty, price_tp, price_sl)
+                            await redis_trade.push_historical_tick(
+                                f"POS_ACTIVE:{inst['label']}", 
+                                {"status": "OPEN", "type": "MOMENTUM", "time": time.time()}, 
+                                max_elements=1
+                            )
+                            await tg_dispatcher.push(
+                                f"🚀 <b>[MOMENTUM ENGINE: TRADE DEPLOYED]</b>\n"
+                                f"──────────────────────────────\n"
+                                f"📈 Instrument: <b>{inst['label']}</b> | ROC: <code>{mom_metrics['roc']}%</code>\n"
+                                f"💰 Wejście: <b>{current_price} USDT</b>\n"
+                                f"🎯 TP (+3%): <code>{price_tp} USDT</code> | 🛑 SL (-2%): <code>{price_sl} USDT</code>"
+                            )
         except Exception as e:
             logger.error(f"❌ [MOMENTUM-ERROR] Błąd w workerze Momentum: {e}")
         
-        await asyncio.sleep(300)
+        # Zsynchronizowany interwał 3-minutowy (180s)
+        await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 3: WORKER BREAKOUT W TLE
+# STRATEGIA 3: WORKER BREAKOUT W TLE (SYNCHRO 180s + TELEMETRIA)
 # =========================================================================
 async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("💥 [BREAKOUT-WORKER] Uruchomiono niezależny wątek Breakout w tle.")
@@ -819,6 +801,7 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                     active_count = len(data_k.get("result", []))
             
             if active_count >= 3:
+                logger.info("🛡️ [BREAKOUT] Limit 3 pozycji osiągnięty. Worker wstrzymuje skanowanie.")
                 await asyncio.sleep(60)
                 continue
 
@@ -829,40 +812,44 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                 candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=30)
                 brk_metrics = BreakoutQuantCore.calculate_breakout(candles_raw, period=20)
                 
-                if brk_metrics and brk_metrics["signal"]:
-                    logger.info(f"💥 [BREAKOUT-SIGNAL] Wykryto wybicie dla {inst['label']} | Bw: {brk_metrics['bandwidth']}")
+                if brk_metrics:
                     current_price = float(candles_raw[-1][4])
-                    total_balance = await inst["client"].get_account_balance("USDT")
+                    logger.info(f"💥 [BREAKOUT-SCAN] {inst['label']} | Bw: {brk_metrics['bandwidth']} (Komp < 0.015) | P: {current_price} vs Banda: {brk_metrics['upper_band']}")
                     
-                    risk_capital = total_balance * 0.01
-                    calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.025), inst["round_digits"]))
-                    
-                    order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
-                    if order_res and order_res.get("code") == "0":
-                        price_tp = round(current_price * 1.04, inst["price_round"])
-                        price_sl = round(current_price * 0.98, inst["price_round"])
+                    if brk_metrics["signal"]:
+                        logger.info(f"🚨 [BREAKOUT-TRIGGER] Wykryto potwierdzone wybicie dla {inst['label']}!")
+                        total_balance = await inst["client"].get_account_balance("USDT")
                         
-                        await asyncio.sleep(0.3)
-                        await inst["client"].execute_oco_protection(inst["symbol"], calculated_qty, price_tp, price_sl)
-                        await redis_trade.push_historical_tick(
-                            f"POS_ACTIVE:{inst['label']}", 
-                            {"status": "OPEN", "type": "BREAKOUT", "time": time.time()}, 
-                            max_elements=1
-                        )
-                        await tg_dispatcher.push(
-                            f"💥 <b>[BREAKOUT ENGINE: TRADE DEPLOYED]</b>\n"
-                            f"──────────────────────────────\n"
-                            f"📈 Instrument: <b>{inst['label']}</b> | Bw: <code>{brk_metrics['bandwidth']}</code>\n"
-                            f"💰 Wejście: <b>{current_price} USDT</b>\n"
-                            f"🎯 TP (+4%): <code>{price_tp} USDT</code> | 🛑 SL (-2%): <code>{price_sl} USDT</code>"
-                        )
+                        risk_capital = total_balance * 0.01
+                        calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.025), inst["round_digits"]))
+                        
+                        order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
+                        if order_res and order_res.get("code") == "0":
+                            price_tp = round(current_price * 1.04, inst["price_round"])
+                            price_sl = round(current_price * 0.98, inst["price_round"])
+                            
+                            await asyncio.sleep(0.3)
+                            await inst["client"].execute_oco_protection(inst["symbol"], calculated_qty, price_tp, price_sl)
+                            await redis_trade.push_historical_tick(
+                                f"POS_ACTIVE:{inst['label']}", 
+                                {"status": "OPEN", "type": "BREAKOUT", "time": time.time()}, 
+                                max_elements=1
+                            )
+                            await tg_dispatcher.push(
+                                f"💥 <b>[BREAKOUT ENGINE: TRADE DEPLOYED]</b>\n"
+                                f"──────────────────────────────\n"
+                                f"📈 Instrument: <b>{inst['label']}</b> | Bw: <code>{brk_metrics['bandwidth']}</code>\n"
+                                f"💰 Wejście: <b>{current_price} USDT</b>\n"
+                                f"🎯 TP (+4%): <code>{price_tp} USDT</code> | 🛑 SL (-2%): <code>{price_sl} USDT</code>"
+                            )
         except Exception as e:
             logger.error(f"❌ [BREAKOUT-ERROR] Błąd w workerze Breakout: {e}")
         
-        await asyncio.sleep(300)
+        # Zsynchronizowany interwał 3-minutowy (180s)
+        await asyncio.sleep(180)
 
 # =========================================================================
-# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - 3 STRATEGIE)
+# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON)
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER
