@@ -556,13 +556,18 @@ async def run_async_pipeline():
             okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
             total_balance = await okx_client.get_account_balance("USDT")
 
+            # MELDUNEK TELEMETRYCZNY: Test aktywnego połączenia z Telegramem
+            await tg.push(
+                f"🚀 <b>[OKX ENGINE ONLINE]</b>\n"
+                f"──────────────────────────────\n"
+                f"🤖 Status: <b>Połączono z rynkiem EEA</b>\n"
+                f"💰 Wirtualne saldo USDT: <b>{total_balance}</b>\n"
+                f"📊 Takt skanera: <b>co 3 minuty</b>\n"
+                f"──────────────────────────────"
+            )
+
             # Zoptymalizowany koszyk 4 płynnych instrumentów pod takt 3-minutowy (Limit Upstash Free)
             instruments = [
-                {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
-                {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_USDT", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-                {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_USDT", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
-                {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_USDT", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
-            ]
 
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
