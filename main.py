@@ -370,6 +370,58 @@ class BreakoutQuantCore:
         }
 
 # =========================================================================
+# RDZEŃ QUANT 4: GRID TRADING (SIATKA KONSOLIDACYJNA - ETAP 3)
+# =========================================================================
+class GridQuantCore:
+    @staticmethod
+    def calculate_grid_levels(
+        candles: List[List[str]], 
+        grid_step_pct: float = 0.005, 
+        levels: int = 3
+    ) -> Optional[Dict[str, Any]]:
+        """Weryfikuje reżim konsolidacji bocznej i wyznacza drabinkę siatki."""
+        if len(candles) < 20:
+            return None
+
+        closes = [float(c[4]) for c in candles]
+        highs = [float(c[2]) for c in candles]
+        lows = [float(c[3]) for c in candles]
+        current_price = closes[-1]
+
+        tr_list = []
+        for i in range(1, 15):
+            h = highs[-i]
+            l = lows[-i]
+            prev_c = closes[-(i + 1)]
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            tr_list.append(tr)
+        atr = sum(tr_list) / len(tr_list)
+        atr_pct = (atr / current_price) * 100.0
+
+        past_price = closes[-11] if len(closes) >= 11 else closes[0]
+        roc = ((current_price - past_price) / past_price) * 100.0 if past_price > 0 else 0.0
+
+        is_consolidation = (0.2 <= atr_pct <= 0.8) and (abs(roc) < 1.0)
+
+        buy_levels = []
+        for k in range(1, levels + 1):
+            price_buy = round(current_price * (1.0 - (k * grid_step_pct)), 4)
+            price_tp = round(price_buy * (1.0 + grid_step_pct), 4)
+            buy_levels.append({
+                "level": k,
+                "buy_price": price_buy,
+                "tp_price": price_tp
+            })
+
+        return {
+            "current_price": current_price,
+            "atr_pct": round(atr_pct, 2),
+            "roc": round(roc, 2),
+            "is_consolidation": is_consolidation,
+            "levels": buy_levels
+        }
+
+# =========================================================================
 # SYSTEMOWY KLIENT GIEŁDY OKX SPOT (V5 REST API - SANDBOX & PRODUCTION)
 # =========================================================================
 class OKXSpotClient:
@@ -521,6 +573,32 @@ class OKXSpotClient:
                 return await r.json()
         except Exception as e:
             logger.error(f"[OKX-ORDER-ERROR] Błąd wysyłania zlecenia {side} dla {symbol}: {e}")
+            return None
+
+    async def execute_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Optional[Dict[str, Any]]:
+        """Egzekucja pasywnego zlecenia z limitem ceny dla siatki (Grid Trading)."""
+        if not self.api_key or not self.secret_key or not self.passphrase:
+            return None
+        await self.rate_limiter.consume()
+        
+        request_path = "/api/v5/trade/order"
+        body_dict = {
+            "instId": symbol,
+            "tdMode": "cash",
+            "side": side.lower(),
+            "ordType": "limit",
+            "px": str(price),
+            "sz": str(quantity)
+        }
+        body_json = json.dumps(body_dict)
+        url = f"{self.base_url}{request_path}"
+        headers = self._get_headers("POST", request_path, body_json)
+
+        try:
+            async with self.session.post(url, data=body_json, headers=headers, timeout=5) as r:
+                return await r.json()
+        except Exception as e:
+            logger.error(f"[OKX-LIMIT-ORDER-ERROR] Błąd zlecenia Limit {side} dla {symbol}: {e}")
             return None
 
     async def execute_oco_protection(self, symbol: str, quantity: float, price_tp: float, price_sl: float) -> Optional[Dict[str, Any]]:
@@ -775,7 +853,6 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
         except Exception as e:
             logger.error(f"❌ [MOMENTUM-ERROR] Błąd w workerze Momentum: {e}")
         
-        # Zsynchronizowany interwał 3-minutowy (180s)
         await asyncio.sleep(180)
 
 # =========================================================================
@@ -845,15 +922,84 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
         except Exception as e:
             logger.error(f"❌ [BREAKOUT-ERROR] Błąd w workerze Breakout: {e}")
         
-        # Zsynchronizowany interwał 3-minutowy (180s)
         await asyncio.sleep(180)
 
 # =========================================================================
-# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON)
+# STRATEGIA 4: WORKER GRID TRADING W TLE (ETAP 3 - SIATKA KONSOLIDACJI)
+# =========================================================================
+async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_client):
+    logger.info("🧱 [GRID-WORKER] Uruchomiono niezależny wątek Grid Trading w tle.")
+    
+    instruments = [
+        {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_GRID", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
+        {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_GRID", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
+        {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_GRID", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
+        {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_GRID", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
+    ]
+
+    while not ASYNC_SHUTDOWN_EVENT.is_set():
+        try:
+            url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
+            async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
+                active_count = 0
+                if resp_k.status == 200:
+                    data_k = await resp_k.json()
+                    active_count = len(data_k.get("result", []))
+            
+            if active_count >= 3:
+                logger.info("🛡️ [GRID] Limit 3 pozycji osiągnięty. Worker wstrzymuje skanowanie.")
+                await asyncio.sleep(60)
+                continue
+
+            for inst in instruments:
+                if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
+                    break
+                
+                candles_raw = await inst["client"].get_macro_candles_raw(inst["symbol"], bar="15m", limit=30)
+                grid_metrics = GridQuantCore.calculate_grid_levels(candles_raw, grid_step_pct=0.005, levels=3)
+                
+                if grid_metrics:
+                    cur_p = grid_metrics["current_price"]
+                    logger.info(f"🧱 [GRID-SCAN] {inst['label']} | ATR: {grid_metrics['atr_pct']}% (0.2-0.8) | ROC: {grid_metrics['roc']}% | Konsolidacja: {grid_metrics['is_consolidation']}")
+                    
+                    if grid_metrics["is_consolidation"]:
+                        first_level = grid_metrics["levels"][0]
+                        price_buy = first_level["buy_price"]
+                        price_tp = first_level["tp_price"]
+                        
+                        total_balance = await inst["client"].get_account_balance("USDT")
+                        risk_capital = total_balance * 0.01
+                        calculated_qty = max(inst["min_qty"], round(risk_capital / price_buy, inst["round_digits"]))
+                        
+                        logger.info(f"🚨 [GRID-TRIGGER] Konsolidacja boczna wykryta dla {inst['label']}. Rozstawianie drabinki.")
+                        order_res = await inst["client"].execute_limit_order(inst["symbol"], "buy", calculated_qty, price_buy)
+                        
+                        if order_res and order_res.get("code") == "0":
+                            price_sl = round(price_buy * 0.985, inst["price_round"])
+                            await redis_trade.push_historical_tick(
+                                f"POS_ACTIVE:{inst['label']}", 
+                                {"status": "OPEN", "type": "GRID", "time": time.time()}, 
+                                max_elements=1
+                            )
+                            await tg_dispatcher.push(
+                                f"🧱 <b>[GRID ENGINE: LIMIT ORDER PLACED]</b>\n"
+                                f"──────────────────────────────\n"
+                                f"📈 Instrument: <b>{inst['label']}</b>\n"
+                                f"📥 Kupno (Limit L1): <b>{price_buy} USDT</b>\n"
+                                f"🎯 Take Profit: <code>{price_tp} USDT</code> (+0.5%)\n"
+                                f"🛑 Stop Loss: <code>{price_sl} USDT</code> (-1.5%)"
+                            )
+        except Exception as e:
+            logger.error(f"❌ [GRID-ERROR] Błąd w workerze Grid: {e}")
+            
+        await asyncio.sleep(180)
+
+# =========================================================================
+# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - 4 SILNIKI)
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER
-    logger.info("⚡ [TRADING MULTI-TASKING ONLINE] Uruchamianie workerów tła (Momentum + Breakout)...")
+    logger.info("⚡ [TRADING MULTI-TASKING ONLINE] Uruchamianie workerów tła (Momentum + Breakout + Grid)...")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
     if RATE_LIMITER is None:
         RATE_LIMITER = TokenBucketRateLimiter()
@@ -873,9 +1019,11 @@ async def continuous_async_cron(loop):
 
         momentum_task = None
         breakout_task = None
+        grid_task = None
         try:
             momentum_task = asyncio.create_task(independent_momentum_worker(session, redis_trade, tg, okx_client))
             breakout_task = asyncio.create_task(independent_breakout_worker(session, redis_trade, tg, okx_client))
+            grid_task = asyncio.create_task(independent_grid_worker(session, redis_trade, tg, okx_client))
 
             while not ASYNC_SHUTDOWN_EVENT.is_set():
                 await asyncio.sleep(1)
@@ -883,7 +1031,7 @@ async def continuous_async_cron(loop):
         except Exception as e:
             logger.error(f"❌ [CRON-LOOP-ERROR] Krytyczny błąd w pętli wielozadaniowej: {e}")
         finally:
-            tasks = [t for t in [momentum_task, breakout_task] if t]
+            tasks = [t for t in [momentum_task, breakout_task, grid_task] if t]
             for t in tasks:
                 t.cancel()
             if tasks:
