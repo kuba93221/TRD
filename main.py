@@ -48,75 +48,76 @@ def health_check():
     return "OK", 200
 
 # =========================================================================
-# WIZJER DIAGNOSTYCZNY AUTORYZACJI OKX (SKANER KRZYŻOWY LIVE VS DEMO)
+# WIZJER DIAGNOSTYCZNY AUTORYZACJI OKX (EUROPEJSKI KLASTER EEA)
 # =========================================================================
 @app.route('/test-auth', methods=['GET'])
 def web_test_okx_handshake():
-    """Weryfikacja, w której bazie (Live czy Demo) faktycznie znajduje się klucz."""
+    """Weryfikacja autoryzacji na europejskim klastrze OKX (eea.okx.com)."""
     import urllib.error
+    import time
 
     api_key = str(os.environ.get("OKX_API_KEY", "")).strip()
     secret_key = str(os.environ.get("OKX_SECRET_KEY", "")).strip()
     passphrase = str(os.environ.get("OKX_PASSPHRASE", "")).strip()
-    base_url = "https://www.okx.com"
+    
+    # KRYTYCZNA ZMIANA Z TWOJEGO ZRZUTU EKRANU:
+    base_url = "https://eea.okx.com" 
     request_path = "/api/v5/account/config"
 
     report = {
         "key_prefix": f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) >= 12 else "INVALID",
+        "api_key_len": len(api_key),
+        "secret_key_len": len(secret_key),
+        "passphrase_len": len(passphrase),
+        "base_url_used": base_url,
         "trials": []
     }
 
     if not all([api_key, secret_key, passphrase]):
-        report["error"] = "Brak zmiennych w panelu Render!"
+        report["error"] = "Brak wymaganych zmiennych w panelu Render!"
         return jsonify(report), 400
 
-    # Wariant 1: Tryb Produkcyjny (Live) - brak nagłówka symulacji
-    # Wariant 2: Tryb Symulacyjny (Demo) - z nagłówkiem x-simulated-trading
-    variants = [
-        ("LIVE_PRODUCTION", False),
-        ("DEMO_SANDBOX", True)
-    ]
+    # Używamy standardowego czasu ISO, który OKX preferuje
+    timestamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+    
+    # Tylko tryb Demo, skoro łączymy się z kontem Demo na EEA
+    message = f"{timestamp}GET{request_path}"
+    mac = hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
+    signature = base64.b64encode(mac.digest()).decode('utf-8')
 
-    for label, is_demo in variants:
-        timestamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        message = f"{timestamp}GET{request_path}"
-        mac = hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
-        signature = base64.b64encode(mac.digest()).decode('utf-8')
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "OK-ACCESS-KEY": api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": passphrase,
+        "x-simulated-trading": "1"
+    }
 
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "OK-ACCESS-KEY": api_key,
-            "OK-ACCESS-SIGN": signature,
-            "OK-ACCESS-TIMESTAMP": timestamp,
-            "OK-ACCESS-PASSPHRASE": passphrase
-        }
-        if is_demo:
-            headers["x-simulated-trading"] = "1"
-
-        try:
-            req = Request(f"{base_url}{request_path}", headers=headers, method="GET")
-            with urlopen(req, timeout=6) as resp:
-                resp_data = json.loads(resp.read().decode('utf-8'))
-                report["trials"].append({
-                    "tryb": label,
-                    "http_status": resp.status,
-                    "okx_code": resp_data.get("code"),
-                    "okx_msg": resp_data.get("msg"),
-                    "acctLv": resp_data.get("data", [{}])[0].get("acctLv") if resp_data.get("data") else None
-                })
-        except urllib.error.HTTPError as he:
-            err_body = he.read().decode('utf-8', errors='ignore')
+    try:
+        req = Request(f"{base_url}{request_path}", headers=headers, method="GET")
+        with urlopen(req, timeout=6) as resp:
+            resp_data = json.loads(resp.read().decode('utf-8'))
             report["trials"].append({
-                "tryb": label,
-                "http_status": he.code,
-                "response": err_body[:200]
+                "tryb": "EEA_DEMO_SANDBOX",
+                "http_status": resp.status,
+                "okx_code": resp_data.get("code"),
+                "okx_msg": resp_data.get("msg"),
+                "data": resp_data.get("data")
             })
-        except Exception as e:
-            report["trials"].append({
-                "tryb": label,
-                "exception": str(e)
-            })
+    except urllib.error.HTTPError as he:
+        err_body = he.read().decode('utf-8', errors='ignore')
+        report["trials"].append({
+            "tryb": "EEA_DEMO_SANDBOX",
+            "http_status": he.code,
+            "response": err_body[:200]
+        })
+    except Exception as e:
+        report["trials"].append({
+            "tryb": "EEA_DEMO_SANDBOX",
+            "exception": str(e)
+        })
 
     return jsonify(report), 200
 # =========================================================================
