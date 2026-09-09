@@ -556,16 +556,6 @@ async def run_async_pipeline():
             okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
             total_balance = await okx_client.get_account_balance("USDT")
 
-            # MELDUNEK TELEMETRYCZNY: Weryfikacja połączenia z Telegramem
-            await tg.push(
-                f"🚀 <b>[OKX ENGINE ONLINE]</b>\n"
-                f"──────────────────────────────\n"
-                f"🤖 Status: <b>Połączono z rynkiem EEA</b>\n"
-                f"💰 Wirtualne saldo USDT: <b>{total_balance}</b>\n"
-                f"📊 Takt skanera: <b>co 3 minuty</b>\n"
-                f"──────────────────────────────"
-            )
-
             # Zoptymalizowany koszyk 4 płynnych instrumentów pod takt 3-minutowy (Limit Upstash Free)
             instruments = [
                 {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_USDT", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
@@ -585,7 +575,6 @@ async def run_async_pipeline():
                     continue
 
                 current_price = ticker.get("last", 0.0)
-                # Zapis do odizolowanej bazy z prefiksem TRADE_ i auto-TTL 7 dni
                 await redis_trade.push_historical_tick(inst["label"], ticker, max_elements=50)
                 history = await redis_trade.get_historical_ticks(inst["label"], max_elements=50)
                 samples_count = len(history)
@@ -609,10 +598,17 @@ async def run_async_pipeline():
                     logger.info(f"📊 [{inst['label']}] P: {current_price} | Z: {z} | RSI: {rsi} | Bw: {bandwidth} | T: {trend}")
                     await redis_trade.incr_metric(f"ticks_{inst['label']}")
 
-                    # Filtr zmienności: odrzucenie martwej konsolidacji
                     if bandwidth < 0.001:
                         logger.info(f"⚠️ [{inst['label']}] Blokada: BandWidth skrajnie niski ({bandwidth}). Rynek w kompresji.")
                         continue
+
+                    # Alert wczesnego ostrzegania na Telegram (zbliżanie się do wyprzedania)
+                    if -1.5 < z <= -1.2 and trend == "LONG_ONLY":
+                        await tg.push(
+                            f"👀 <b>[OBSERWACJA: {inst['label']}]</b>\n"
+                            f"Cena zbliża się do strefy wejścia!\n"
+                            f"Z-Score: <code>{z}</code> | RSI: <code>{rsi}</code> | P: <code>{current_price}</code>"
+                        )
 
                     # Zarządzanie ryzykiem: 1% salda kapitału
                     risk_capital = total_balance * 0.01
