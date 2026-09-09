@@ -733,10 +733,29 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                 if mom_metrics and mom_metrics["signal"]:
                     logger.info(f"🚀 [MOMENTUM-SIGNAL] Silny impuls dla {inst['label']} | ROC: {mom_metrics['roc']}%")
                     
-        except Exception as e:
-            logger.error(f"❌ [MOMENTUM-ERROR] Błąd w workerze Momentum: {e}")
-        
-        await asyncio.sleep(300)
+                    # Pobieramy aktualne saldo i cenę dla Momentum
+                    current_price = mom_metrics["current"]
+                    total_balance = await inst["client"].get_account_balance("USDT")
+                    
+                    risk_capital = total_balance * 0.01
+                    calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.02), inst["round_digits"]))
+                    
+                    # Egzekucja zlecenia rynkowego dla Momentum
+                    order_res = await inst["client"].execute_market_order(inst["symbol"].replace("_", "-"), "buy", calculated_qty)
+                    
+                    if order_res and order_res.get("code") == "0":
+                        price_tp = round(current_price * 1.03, inst["price_round"]) # +3% Take Profit dla momentum
+                        price_sl = round(current_price * 0.98, inst["price_round"]) # -2% Stop Loss
+                        
+                        await asyncio.sleep(0.3)
+                        await inst["client"].execute_oco_protection(inst["symbol"].replace("_", "-"), calculated_qty, price_tp, price_sl)
+                        await redis_trade.push_historical_tick(f"POS_ACTIVE:{inst['label']}", {"status": "OPEN", "type": "MOMENTUM", "time": time.time()}, max_elements=1)
+                        
+                        await tg.push(
+                            f"🚀 <b>[MOMENTUM ENGINE: TRADE DEPLOYED]</b>\n"
+                            f"📈 Instrument: <b>{inst['label']}</b> | ROC: <code>{mom_metrics['roc']}%</code>\n"
+                            f"💰 Wejście: <b>{current_price} USDT</b>"
+                        )
 
 # =========================================================================
 # ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON)
