@@ -757,8 +757,8 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                             f"💰 Wejście: <b>{current_price} USDT</b>"
                         )
 
-# =========================================================================
-# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - POPRAWIONY)
+## =========================================================================
+# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - FIX SYNTAX)
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER
@@ -780,17 +780,19 @@ async def continuous_async_cron(loop):
         )
         okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
 
-        # Uruchamiamy niezależne zadanie Momentum w tle z pełną obsługą błędów
+        momentum_task = None
         try:
             momentum_task = asyncio.create_task(independent_momentum_worker(session, redis_trade, tg, okx_client))
 
             while not ASYNC_SHUTDOWN_EVENT.is_set():
                 await asyncio.sleep(1)
 
-            momentum_task.cancel()
-            await asyncio.gather(momentum_task, return_exceptions=True)
         except Exception as e:
             logger.error(f"❌ [CRON-LOOP-ERROR] Krytyczny błąd w pętli wielozadaniowej: {e}")
+        finally:
+            if momentum_task:
+                momentum_task.cancel()
+                await asyncio.gather(momentum_task, return_exceptions=True)
 
     logger.info("👋 [SHUTDOWN] Potok zamknięty bezpiecznie. Wszystkie stany skonsolidowane.")
 
