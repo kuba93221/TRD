@@ -698,16 +698,16 @@ async def run_async_pipeline():
             gc.collect()
 
 # =========================================================================
-# ETAP 1: NIEZALEŻNY WORKER MOMENTUM W TLE
+# ETAP 1: NIEZALEŻNY WORKER MOMENTUM W TLE (POPRAWIONY SKŁADNIOWO)
 # =========================================================================
 async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🚀 [MOMENTUM-WORKER] Uruchomiono niezależny wątek analityczny Momentum w tle.")
     
     instruments = [
-        {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_MOM"},
-        {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_MOM"},
-        {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_MOM"},
-        {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_MOM"}
+        {"client": okx_client, "symbol": "BTC-USDT", "label": "BTC_MOM", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
+        {"client": okx_client, "symbol": "ETH-USDT", "label": "ETH_MOM", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
+        {"client": okx_client, "symbol": "SOL-USDT", "label": "SOL_MOM", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
+        {"client": okx_client, "symbol": "XRP-USDT", "label": "XRP_MOM", "min_qty": 0.1, "round_digits": 1, "price_round": 4}
     ]
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
@@ -733,32 +733,35 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                 if mom_metrics and mom_metrics["signal"]:
                     logger.info(f"🚀 [MOMENTUM-SIGNAL] Silny impuls dla {inst['label']} | ROC: {mom_metrics['roc']}%")
                     
-                    # Pobieramy aktualne saldo i cenę dla Momentum
                     current_price = mom_metrics["current"]
                     total_balance = await inst["client"].get_account_balance("USDT")
                     
                     risk_capital = total_balance * 0.01
                     calculated_qty = max(inst["min_qty"], round(risk_capital / (current_price * 0.02), inst["round_digits"]))
                     
-                    # Egzekucja zlecenia rynkowego dla Momentum
-                    order_res = await inst["client"].execute_market_order(inst["symbol"].replace("_", "-"), "buy", calculated_qty)
+                    order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
                     
                     if order_res and order_res.get("code") == "0":
-                        price_tp = round(current_price * 1.03, inst["price_round"]) # +3% Take Profit dla momentum
-                        price_sl = round(current_price * 0.98, inst["price_round"]) # -2% Stop Loss
+                        price_tp = round(current_price * 1.03, inst["price_round"])
+                        price_sl = round(current_price * 0.98, inst["price_round"])
                         
                         await asyncio.sleep(0.3)
-                        await inst["client"].execute_oco_protection(inst["symbol"].replace("_", "-"), calculated_qty, price_tp, price_sl)
+                        await inst["client"].execute_oco_protection(inst["symbol"], calculated_qty, price_tp, price_sl)
                         await redis_trade.push_historical_tick(f"POS_ACTIVE:{inst['label']}", {"status": "OPEN", "type": "MOMENTUM", "time": time.time()}, max_elements=1)
                         
-                        await tg.push(
+                        await tg_dispatcher.push(
                             f"🚀 <b>[MOMENTUM ENGINE: TRADE DEPLOYED]</b>\n"
                             f"📈 Instrument: <b>{inst['label']}</b> | ROC: <code>{mom_metrics['roc']}%</code>\n"
                             f"💰 Wejście: <b>{current_price} USDT</b>"
                         )
+                        
+        except Exception as e:
+            logger.error(f"❌ [MOMENTUM-ERROR] Błąd w workerze Momentum: {e}")
+        
+        await asyncio.sleep(300)
 
-## =========================================================================
-# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - FIX SYNTAX)
+# =========================================================================
+# ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - CLEAN)
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER
@@ -795,7 +798,6 @@ async def continuous_async_cron(loop):
                 await asyncio.gather(momentum_task, return_exceptions=True)
 
     logger.info("👋 [SHUTDOWN] Potok zamknięty bezpiecznie. Wszystkie stany skonsolidowane.")
-
 def background_scheduler_thread():
     global BACKGROUND_LOOP
     loop = asyncio.new_event_loop()
