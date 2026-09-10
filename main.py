@@ -641,6 +641,30 @@ class OKXSpotClient:
         except Exception as e:
             logger.error(f"❌ [OKX-PENDING-CHECK-ERROR] Błąd sprawdzania otwartych zleceń {symbol}: {e}")
             return True
+    # =========================================================================
+    # KROK DOMYKAJĄCY 1: SPRAWDZENIE STATUSU ZLECENIA (CZY JUŻ KUPIŁO?)
+    # =========================================================================
+    async def get_order_state(self, symbol: str, ord_id: str) -> Optional[str]:
+        """Zwraca status zlecenia z OKX: 'live', 'filled', 'canceled' lub None."""
+        if not self.api_key or not self.secret_key or not self.passphrase:
+            return None
+        await self.rate_limiter.consume()
+
+        request_path = f"/api/v5/trade/order?instId={symbol}&ordId={ord_id}"
+        url = f"{self.base_url}{request_path}"
+        headers = self._get_headers("GET", request_path)
+
+        try:
+            async with self.session.get(url, headers=headers, timeout=5) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if data.get("code") == "0" and data.get("data"):
+                    return data["data"][0].get("state")  # np. "filled"
+                return None
+        except Exception as e:
+            logger.error(f"❌ [OKX-ORDER-STATE-ERROR] Błąd sprawdzania statusu zlecenia {ord_id}: {e}")
+            return None
 
     # =========================================================================
     # METODA EGZEKUCJI LIMIT (GRID TRADING)
