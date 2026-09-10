@@ -798,7 +798,7 @@ async def run_async_pipeline():
         return
 
     async with PIPELINE_LOCK:
-        logger.info("🕵️ [POTOK OKX] Skanowanie koszyka rynków SPOT USDC i analiza wielokryteriowa...")
+        logger.info("🕵️ [POTOK OKX] Skanowanie koszyka 4 rynków SPOT USDC...")
         if RATE_LIMITER is None:
             RATE_LIMITER = TokenBucketRateLimiter()
 
@@ -817,21 +817,18 @@ async def run_async_pipeline():
             okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
             total_balance = await okx_client.get_account_balance(QUOTE_CCY)
 
-            # LIMIT KOSZYKA ALFA (TWARDY LIMIT: MAX 2 POZYCJE)
+            # SPRAWDZENIE ZAJĘTOŚCI KOSZYKA ALFA (MAX 2 POZYCJE)
+            alpha_active_count = 0
             try:
                 url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                 async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
-                    alpha_active_count = 0
                     if resp_k.status == 200:
                         data_k = await resp_k.json()
                         alpha_active_count = len(data_k.get("result", []))
-                
-                if alpha_active_count >= 2:
-                    logger.info("🛡️ [ALPHA LIMIT] Osiągnięto limit 2 pozycji dynamicznych. Potok wstrzymuje nowe wejścia.")
-                    return
             except Exception as e:
                 logger.error(f"⚠️ [SLOTS CHECK ERROR] Błąd weryfikacji slotów ALFA: {e}")
 
+            # ZAWSZE PEŁNY KOSZYK 4 WALUT
             instruments = [
                 {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
                 {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
@@ -845,7 +842,7 @@ async def run_async_pipeline():
 
                 ticker = await inst["client"].get_market_ticker(inst["symbol"])
                 if not ticker:
-                    logger.warning(f"⚠️ [{inst['label']}] Oczekiwanie na kwotowanie SPOT (REST/WS)... Pomijam w tym cyklu.")
+                    logger.warning(f"⚠️ [{inst['label']}] Oczekiwanie na kwotowanie SPOT... Pomijam w tym cyklu.")
                     continue
 
                 current_price = ticker.get("last", 0.0)
@@ -856,7 +853,7 @@ async def run_async_pipeline():
                 logger.info(f"📥 [{inst['label']}] Kurs SPOT: {current_price} {QUOTE_CCY} | Bufor Redis: {samples_count}/20 próbek")
 
                 if samples_count < 20:
-                    logger.info(f"⏳ [{inst['label']}] Zbieranie historii próbek ({samples_count}/20)... Silnik wstrzymuje analizę.")
+                    logger.info(f"⏳ [{inst['label']}] Zbieranie historii ({samples_count}/20)... Silnik wstrzymuje analizę.")
                     continue
 
                 macro_candles = await inst["client"].get_macro_candles(inst["symbol"], bar="1H", limit=30)
@@ -882,6 +879,11 @@ async def run_async_pipeline():
                             f"Cena zbliża się do strefy wejścia!\n"
                             f"Z-Score: <code>{z}</code> | RSI: <code>{rsi}</code> | P: <code>{current_price}</code>"
                         )
+
+                    # BLOKADA EGZEKUCJI JEŚLI KOSZYK ALFA JEST PEŁNY (MAX 2 POZYCJE)
+                    if alpha_active_count >= 2:
+                        logger.info(f"🛡️ [ALPHA LIMIT] Pozycje ALFA: {alpha_active_count}/2. Blokada nowych zakupów dla {inst['label']}.")
+                        continue
 
                     risk_capital = total_balance * 0.01
                     stop_loss_distance = atr * 2.0
@@ -917,6 +919,7 @@ async def run_async_pipeline():
                                 {"status": "OPEN", "type": "MEAN_REVERSION", "time": time.time()}, 
                                 max_elements=1
                             )
+                            alpha_active_count += 1
 
                             await tg.push(
                                 f"🟩 <b>[OKX TRADING ENGINE: OCO DEPLOYED]</b>\n"
@@ -934,7 +937,7 @@ async def run_async_pipeline():
                         else:
                             err_c = order_res.get("code") if order_res else "ERR"
                             err_m = order_res.get("msg") if order_res else "Connection error"
-                    logger.error(f"❌ [MEAN-REV-REJECTED] Błąd zlecenia {inst['label']}: Code {err_c} -> {err_m}")
+                            logger.error(f"❌ [MEAN-REV-REJECTED] Błąd zlecenia {inst['label']}: Code {err_c} -> {err_m}")
 
             gc.collect()
 
