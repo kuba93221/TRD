@@ -1076,7 +1076,7 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 4: WORKER GRID TRADING (ZABEZPIECZONY PRZED DUBLOWANIEM ZLECEŃ)
+# STRATEGIA 4: WORKER GRID TRADING (PEŁNY CYKL: KUPNO + AUTOMATYCZNA SPRZEDAŻ TP)
 # =========================================================================
 async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🧱 [GRID-WORKER] Uruchomiono niezależny wątek Grid Trading w tle.")
@@ -1093,86 +1093,128 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
             async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
                 active_keys = (await resp_k.json()).get("result", []) if resp_k.status == 200 else []
                 active_count = len(active_keys)
-            
-            if active_count >= 3:
-                logger.info(f"🛡️ [GRID] Limit {active_count}/3 pozycji osiągnięty. Worker czeka.")
-                await asyncio.sleep(60)
-                continue
 
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
-                
-                # 1. Sprawdzenie aktywnej pozycji w Redis
-                if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
+
+                pos_key = f"POS_ACTIVE:{inst['label']}"
+                existing_ticks = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
+                active_pos = existing_ticks[0] if existing_ticks else None
+
+                # -------------------------------------------------------------
+                # ETAP A: CZY MAMY KUPIONĄ POZYCJĘ, KTÓRA CZEKA NA SPRZEDAŻ (TP)?
+                # -------------------------------------------------------------
+                if active_pos and active_pos.get("status") == "PENDING_BUY":
+                    ord_id = active_pos.get("order_id")
+                    state = await inst["client"].get_order_state(inst["symbol"], ord_id)
+
+                    if state == "filled":
+                        qty_to_sell = float(active_pos["qty"])
+                        tp_price = float(active_pos["tp_price"])
+                        logger.info(f"🎯 [GRID-FILL-DETECTED] Zlecenie kupna {ord_id} dla {inst['label']} zrealizowane! Wystawiam SPRZEDAŻ (TP: {tp_price})...")
+
+                        sell_res = await inst["client"].execute_limit_order(inst["symbol"], "sell", qty_to_sell, tp_price)
+                        if sell_res and sell_res.get("code") == "0":
+                            sell_ord_id = sell_res["data"][0]["ordId"]
+                            await redis_trade.push_historical_tick(
+                                pos_key,
+                                {"status": "WAITING_TP", "sell_ord_id": sell_ord_id, "time": time.time()},
+                                max_elements=1
+                            )
+                            await tg_dispatcher.push(
+                                f"🎯 <b>[GRID ENGINE: TAKE PROFIT DEPLOYED]</b>\n"
+                                f"──────────────────────────────\n"
+                                f"📈 Instrument: <b>{inst['label']}</b>\n"
+                                f"💰 Kupiono po: <code>{active_pos['buy_price']} {QUOTE_CCY}</code>\n"
+                                f"📤 Wystawiono sprzedaż: <b>{tp_price} {QUOTE_CCY} (+0.5%)</b>\n"
+                                f"📦 Ilość: <b>{qty_to_sell}</b>"
+                            )
+                        continue
+
+                    elif state in ["canceled", "cancelled"]:
+                        logger.info(f"🧹 [GRID-CLEANUP] Zlecenie {ord_id} dla {inst['label']} zostało anulowane. Zwalniam slot.")
+                        await redis_trade.push_historical_tick(pos_key, {"status": "CLOSED"}, max_elements=1)
+                        continue
+                    else:
+                        # Zlecenie kupna nadal wisi w arkuszu (state == 'live')
+                        continue
+
+                elif active_pos and active_pos.get("status") == "WAITING_TP":
+                    sell_ord_id = active_pos.get("sell_ord_id")
+                    sell_state = await inst["client"].get_order_state(inst["symbol"], sell_ord_id)
+                    if sell_state == "filled":
+                        logger.info(f"🎉 [GRID-CYCLE-COMPLETE] Zysk zrealizowany! TP dla {inst['label']} wypełniony. Zwalniam slot.")
+                        await redis_trade.push_historical_tick(pos_key, {"status": "CLOSED"}, max_elements=1)
+                        await tg_dispatcher.push(f"✅ <b>[GRID PROFIT TAKEN]</b> Pozycja na <b>{inst['label']}</b> zamknięta z zyskiem (+0.5%)!")
+                        continue
                     continue
 
-                # 2. BEZWZGLĘDNA BLOKADA GIEŁDOWA: Sprawdzenie zleceń wiszących w arkuszu OKX
+                # -------------------------------------------------------------
+                # ETAP B: POLOWANIE NA NOWE WEJŚCIE (GDY BRAK AKTYWNEJ POZYCJI)
+                # -------------------------------------------------------------
+                if active_count >= 3:
+                    continue
+
                 if await inst["client"].has_open_orders(inst["symbol"]):
-                    logger.info(f"⏳ [GRID-PENDING-HOLD] W arkuszu giełdy wisi już aktywne zlecenie dla {inst['label']}. Pomijam składanie kolejnego.")
                     continue
 
-                # POBRANIE WSPÓŁDZIELONYCH ŚWIEC Z CACHE
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
                 regime = MarketRegimeArbitrator.get_regime(candles_raw)
-                
-                # BLOKADA W REŻIMIE SILNEGO TRENDU (TRENDING)
+
                 if regime == "TRENDING":
-                    logger.debug(f"🛑 [GRID-BLOCK] {inst['label']} w reżimie TRENDING. Grid wygaszony.")
                     continue
 
                 grid_metrics = GridQuantCore.calculate_grid_levels(candles_raw, grid_step_pct=0.005, levels=3)
-                
-                if grid_metrics:
-                    logger.info(f"🧱 [GRID-SCAN] {inst['label']} | Reżim: {regime} | ATR: {grid_metrics['atr_pct']}% | ROC: {grid_metrics['roc']}% | Konsolidacja: {grid_metrics['is_consolidation']}")
-                    
-                    if grid_metrics["is_consolidation"]:
-                        first_level = grid_metrics["levels"][0]
-                        price_buy = round(first_level["buy_price"], inst["price_round"])
-                        price_tp = round(first_level["tp_price"], inst["price_round"])
-                        
-                        total_balance = await inst["client"].get_account_balance(QUOTE_CCY)
-                        
-                        risk_capital = total_balance * 0.01
-                        sl_pct = 0.015
-                        position_value = min(risk_capital / sl_pct, total_balance * 0.15)
-                        
-                        calculated_qty = round(position_value / price_buy, inst["round_digits"])
-                        calculated_qty = max(inst["min_qty"], calculated_qty)
-                        
-                        if (calculated_qty * price_buy) < 11.0:
-                            calculated_qty = max(calculated_qty, round(11.0 / price_buy, inst["round_digits"]))
-                            calculated_qty = max(inst["min_qty"], calculated_qty)
 
-                        logger.info(f"🚨 [GRID-TRIGGER] Składanie zlecenia Limit dla {inst['label']} | Cena: {price_buy} | Ilość: {calculated_qty}")
-                        order_res = await inst["client"].execute_limit_order(inst["symbol"], "buy", calculated_qty, price_buy)
-                        
-                        if order_res and order_res.get("code") == "0":
-                            price_sl = round(price_buy * 0.985, inst["price_round"])
-                            await redis_trade.push_historical_tick(
-                                f"POS_ACTIVE:{inst['label']}", 
-                                {"status": "OPEN", "type": "GRID", "order_id": order_res["data"][0]["ordId"], "time": time.time()}, 
-                                max_elements=1
-                            )
-                            active_keys.append(f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}")
-                            
-                            await tg_dispatcher.push(
-                                f"🧱 <b>[GRID ENGINE: LIMIT ORDER PLACED]</b>\n"
-                                f"──────────────────────────────\n"
-                                f"📈 Instrument: <b>{inst['label']}</b>\n"
-                                f"📥 Kupno (Limit L1): <b>{price_buy} {QUOTE_CCY}</b>\n"
-                                f"📦 Wielkość: <b>{calculated_qty}</b>\n"
-                                f"🎯 Take Profit: <code>{price_tp} {QUOTE_CCY}</code> (+0.5%)\n"
-                                f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-1.5%)"
-                            )
-                        else:
-                            error_msg = order_res.get("msg") if order_res else "Brak odpowiedzi HTTP"
-                            error_code = order_res.get("code") if order_res else "CONN_ERR"
-                            logger.error(f"❌ [GRID-ORDER-REJECTED] Błąd zlecenia {inst['label']}: Code {error_code} -> {error_msg}")
+                if grid_metrics and grid_metrics["is_consolidation"]:
+                    first_level = grid_metrics["levels"][0]
+                    price_buy = round(first_level["buy_price"], inst["price_round"])
+                    price_tp = round(first_level["tp_price"], inst["price_round"])
+
+                    total_balance = await inst["client"].get_account_balance(QUOTE_CCY)
+                    risk_capital = total_balance * 0.01
+                    sl_pct = 0.015
+                    position_value = min(risk_capital / sl_pct, total_balance * 0.15)
+
+                    calculated_qty = round(position_value / price_buy, inst["round_digits"])
+                    calculated_qty = max(inst["min_qty"], calculated_qty)
+
+                    if (calculated_qty * price_buy) < 11.0:
+                        calculated_qty = max(calculated_qty, round(11.0 / price_buy, inst["round_digits"]))
+                        calculated_qty = max(inst["min_qty"], calculated_qty)
+
+                    logger.info(f"🚨 [GRID-TRIGGER] Składanie zlecenia Limit dla {inst['label']} | Cena: {price_buy} | Ilość: {calculated_qty}")
+                    order_res = await inst["client"].execute_limit_order(inst["symbol"], "buy", calculated_qty, price_buy)
+
+                    if order_res and order_res.get("code") == "0":
+                        ord_id = order_res["data"][0]["ordId"]
+                        await redis_trade.push_historical_tick(
+                            pos_key,
+                            {
+                                "status": "PENDING_BUY",
+                                "order_id": ord_id,
+                                "buy_price": price_buy,
+                                "tp_price": price_tp,
+                                "qty": calculated_qty,
+                                "time": time.time()
+                            },
+                            max_elements=1
+                        )
+                        active_count += 1
+
+                        await tg_dispatcher.push(
+                            f"🧱 <b>[GRID ENGINE: LIMIT ORDER PLACED]</b>\n"
+                            f"──────────────────────────────\n"
+                            f"📈 Instrument: <b>{inst['label']}</b>\n"
+                            f"📥 Kupno (Limit L1): <b>{price_buy} {QUOTE_CCY}</b>\n"
+                            f"📦 Wielkość: <b>{calculated_qty}</b>\n"
+                            f"🎯 Planowany TP: <code>{price_tp} {QUOTE_CCY}</code> (+0.5%)"
+                        )
 
         except Exception as e:
             logger.error(f"❌ [GRID-ERROR] Błąd w workerze Grid: {e}")
-            
+
         await asyncio.sleep(180)
 # =========================================================================
 # ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - 4 SILNIKI)
