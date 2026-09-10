@@ -825,7 +825,8 @@ async def run_async_pipeline():
             instruments = [
                 {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
                 {"client": okx_client, "symbol": f"ETH-{QUOTE_CCY}", "label": f"ETH_{QUOTE_CCY}", "min_qty": 0.0001, "round_digits": 4, "price_round": 2},
-                {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}", "min_qty": 0.01, "round_digits": 2, "price_round": 2}
+                {"client": okx_client, "symbol": f"SOL-{QUOTE_CCY}", "label": f"SOL_{QUOTE_CCY}", "min_qty": 0.01, "round_digits": 2, "price_round": 2},
+                {"client": okx_client, "symbol": f"XRP-{QUOTE_CCY}", "label": f"XRP_{QUOTE_CCY}", "min_qty": 1.0, "round_digits": 2, "price_round": 4}
             ]
 
             for inst in instruments:
