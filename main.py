@@ -1052,7 +1052,7 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 4: WORKER GRID TRADING (SYNCHRO 180s - ARBITRAŻ REŻIMU)
+# STRATEGIA 4: WORKER GRID TRADING (ZABEZPIECZONY PRZED DUBLOWANIEM ZLECEŃ)
 # =========================================================================
 async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("🧱 [GRID-WORKER] Uruchomiono niezależny wątek Grid Trading w tle.")
@@ -1079,7 +1079,13 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
                 
+                # 1. Sprawdzenie aktywnej pozycji w Redis
                 if f"{redis_trade.prefix}POS_ACTIVE:{inst['label']}" in active_keys:
+                    continue
+
+                # 2. BEZWZGLĘDNA BLOKADA GIEŁDOWA: Sprawdzenie zleceń wiszących w arkuszu OKX
+                if await inst["client"].has_open_orders(inst["symbol"]):
+                    logger.info(f"⏳ [GRID-PENDING-HOLD] W arkuszu giełdy wisi już aktywne zlecenie dla {inst['label']}. Pomijam składanie kolejnego.")
                     continue
 
                 # POBRANIE WSPÓŁDZIELONYCH ŚWIEC Z CACHE
@@ -1144,7 +1150,6 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
             logger.error(f"❌ [GRID-ERROR] Błąd w workerze Grid: {e}")
             
         await asyncio.sleep(180)
-
 # =========================================================================
 # ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON - 4 SILNIKI)
 # =========================================================================
