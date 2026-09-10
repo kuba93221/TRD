@@ -1155,20 +1155,25 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                 existing_ticks = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
                 active_pos = existing_ticks[0] if existing_ticks else None
 
-                # -------------------------------------------------------------
-                # ETAP A: ZARZĄDZANIE POZYCJĄ AKTYWNĄ (OCZEKIWANIE NA BUY / TP / SL)
-                # -------------------------------------------------------------
+                # =========================================================================
+                # KROK NAPRAWCZY: ODBLOKOWANIE TELEGRAMU I OBSŁUGA PROWIZJI DLA ZLECENIA TP
+                # =========================================================================
                 if active_pos and active_pos.get("status") == "PENDING_BUY":
                     ord_id = active_pos.get("order_id")
                     state = await inst["client"].get_order_state(inst["symbol"], ord_id)
 
                     if state == "filled":
-                        qty_to_sell = float(active_pos["qty"])
+                        # Uwzględniamy potrącenie prowizji (0.2% marginesu), aby uniknąć błędu 51001
+                        raw_qty = float(active_pos["qty"])
+                        qty_to_sell = round(raw_qty * 0.998, inst["round_digits"])
+                        qty_to_sell = max(inst["min_qty"], qty_to_sell)
+
                         tp_price = float(active_pos["tp_price"])
                         sl_price = float(active_pos.get("sl_price", 0.0))
-                        logger.info(f"🎯 [GRID-FILL-DETECTED] Kupno {ord_id} dla {inst['label']} zrealizowane! Wystawiam TP: {tp_price} | SL: {sl_price}")
+                        logger.info(f"🎯 [GRID-FILL-DETECTED] Kupno {ord_id} dla {inst['label']} zrealizowane! Wystawiam TP: {tp_price} (ilość: {qty_to_sell}) | SL: {sl_price}")
 
                         sell_res = await inst["client"].execute_limit_order(inst["symbol"], "sell", qty_to_sell, tp_price)
+                        
                         if sell_res and sell_res.get("code") == "0":
                             sell_ord_id = sell_res["data"][0]["ordId"]
                             await redis_trade.push_historical_tick(
@@ -1192,6 +1197,17 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                                 f"📤 Wystawiono TP: <b>{tp_price} {QUOTE_CCY} (+0.5%)</b>\n"
                                 f"🛑 Stop Loss: <code>{sl_price} {QUOTE_CCY} (-1.5%)</code>\n"
                                 f"📦 Ilość: <b>{qty_to_sell}</b>"
+                            )
+                        else:
+                            # Przechwytujemy odrzucenie zlecenia przez OKX i informujemy w logach oraz na Telegramie
+                            err_c = sell_res.get("code") if sell_res else "BRAK_ODPOWIEDZI"
+                            err_m = sell_res.get("msg") if sell_res else "Timeout lub błąd sieci"
+                            logger.error(f"❌ [GRID-TP-REJECTED] Odrzucono zlecenie TP dla {inst['label']}! Kod: {err_c} | Msg: {err_m}")
+                            await tg_dispatcher.push(
+                                f"⚠️ <b>[GRID ERROR: TP REJECTED]</b>\n"
+                                f"Instrument: <b>{inst['label']}</b>\n"
+                                f"Kod błędu OKX: <code>{err_c}</code>\n"
+                                f"Komunikat: <i>{err_m}</i>"
                             )
                         continue
 
