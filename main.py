@@ -588,6 +588,9 @@ class OKXSpotClient:
             logger.error(f"[OKX-RAW-CANDLES-EXCEPTION] Błąd pobierania surowych świec {symbol}: {e}")
             return []
 
+    # =========================================================================
+    # POPRAWKA 1: OBSŁUGA ZLECEŃ MARKET Z WYMUSZONĄ JEDNOSTKĄ BAZOWĄ
+    # =========================================================================
     async def execute_market_order(self, symbol: str, side: str, quantity: float) -> Optional[Dict[str, Any]]:
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None
@@ -599,7 +602,8 @@ class OKXSpotClient:
             "tdMode": "cash",
             "side": side.lower(),
             "ordType": "market",
-            "sz": str(quantity)
+            "sz": str(quantity),
+            "tgtCcy": "base_ccy"  # KRYTYCZNA POPRAWKA: zapobiega błędom Code 1 na OKX SPOT
         }
         body_json = json.dumps(body_dict)
         url = f"{self.base_url}{request_path}"
@@ -612,6 +616,35 @@ class OKXSpotClient:
             logger.error(f"[OKX-ORDER-ERROR] Błąd wysyłania zlecenia {side} dla {symbol}: {e}")
             return None
 
+    # =========================================================================
+    # POPRAWKA 2: BLOKADA ANTY-DUBLOWANIA (WERYFIKACJA ARKUSZA GIEŁDY)
+    # =========================================================================
+    async def has_open_orders(self, symbol: str) -> bool:
+        """Sprawdza na giełdzie, czy w arkuszu wisi jakiekolwiek niezrealizowane zlecenie."""
+        if not self.api_key or not self.secret_key or not self.passphrase:
+            return False
+        await self.rate_limiter.consume()
+
+        request_path = f"/api/v5/trade/orders-pending?instId={symbol}"
+        url = f"{self.base_url}{request_path}"
+        headers = self._get_headers("GET", request_path)
+
+        try:
+            async with self.session.get(url, headers=headers, timeout=5) as resp:
+                if resp.status != 200:
+                    return True  # Bezpiecznik: przy błędzie sieci blokujemy nowe zakupy
+                data = await resp.json()
+                if data.get("code") == "0":
+                    orders = data.get("data", [])
+                    return len(orders) > 0
+                return True
+        except Exception as e:
+            logger.error(f"❌ [OKX-PENDING-CHECK-ERROR] Błąd sprawdzania otwartych zleceń {symbol}: {e}")
+            return True
+
+    # =========================================================================
+    # METODA EGZEKUCJI LIMIT (GRID TRADING)
+    # =========================================================================
     async def execute_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Optional[Dict[str, Any]]:
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None
