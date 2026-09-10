@@ -817,7 +817,7 @@ async def run_async_pipeline():
             okx_client = OKXSpotClient(session, RATE_LIMITER, is_sandbox=True)
             total_balance = await okx_client.get_account_balance(QUOTE_CCY)
 
-            # LIMIT KOSZYKA ALFA (MAX 2 POZYCJE)
+            # LIMIT KOSZYKA ALFA (TWARDY LIMIT: MAX 2 POZYCJE)
             try:
                 url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                 async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
@@ -934,7 +934,7 @@ async def run_async_pipeline():
                         else:
                             err_c = order_res.get("code") if order_res else "ERR"
                             err_m = order_res.get("msg") if order_res else "Connection error"
-                            logger.error(f"❌ [MEAN-REV-REJECTED] Błąd zlecenia {inst['label']}: Code {err_c} -> {err_m}")
+                    logger.error(f"❌ [MEAN-REV-REJECTED] Błąd zlecenia {inst['label']}: Code {err_c} -> {err_m}")
 
             gc.collect()
 
@@ -1122,10 +1122,10 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 4: WORKER GRID TRADING (KOSZYK GRID: DEDYKOWANE 3 SLOTY)
+# STRATEGIA 4: WORKER GRID TRADING (DEDYKOWANY KOSZYK GRID: MAX 3 SLOTY)
 # =========================================================================
 async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_client):
-    logger.info("🧱 [GRID-WORKER] Uruchomiono niezależny wątek Grid Trading w tle.")
+    logger.info("🧱 [GRID-WORKER] Uruchomiono niezależny wątek Grid Trading w tle (Limit: 3 sloty).")
     
     instruments = [
         {"client": okx_client, "symbol": f"BTC-{QUOTE_CCY}", "label": f"BTC_{QUOTE_CCY}_GRID", "min_qty": 0.00001, "round_digits": 5, "price_round": 2},
@@ -1136,7 +1136,7 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         try:
-            # WERYFIKACJA DEDYKOWANEJ PULI GRID (LIMIT TWARDY: 3 POZYCJE)
+            # 1. WERYFIKACJA DEDYKOWANEJ PULI GRID (TWARDY LIMIT: 3 POZYCJE)
             url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:GRID:*"
             grid_active_count = 0
             async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
@@ -1233,7 +1233,7 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                     continue
 
                 # -------------------------------------------------------------
-                # ETAP B: POLOWANIE NA NOWE WEJŚCIE W KONSOLIDACJI (MAX 3 SLOTY)
+                # ETAP B: POLOWANIE NA NOWE WEJŚCIE W KONSOLIDACJI (BLOKADA PRZY >= 3)
                 # -------------------------------------------------------------
                 if grid_active_count >= 3:
                     continue
@@ -1304,7 +1304,6 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
             logger.error(f"❌ [GRID-ERROR] Błąd w workerze Grid: {e}")
 
         await asyncio.sleep(180)
-
 # =========================================================================
 # ASYNCHRONICZNY WĄTEK SPOCZYNKOWY (MULTI-TASKING CRON + WEBSOCKET FEED)
 # =========================================================================
