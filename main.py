@@ -543,9 +543,10 @@ class OKXSpotClient:
             headers["x-simulated-trading"] = "1"
         return headers
 
-    async def get_account_balance(self, ccy: str = "USDC") -> float:
+    async def get_wallet_balances(self, ccy: str = "USDC") -> Dict[str, float]:
+        """Pobiera precyzyjny stan portfela: całkowity kapitał (totalEq) oraz wolną gotówkę (availBal)."""
         if not self.api_key or not self.secret_key or not self.passphrase:
-            return 0.0
+            return {"total_equity": 0.0, "available_cash": 0.0}
 
         await self.rate_limiter.consume()
         request_path = f"/api/v5/account/balance?ccy={ccy}"
@@ -557,15 +558,24 @@ class OKXSpotClient:
                 data = await resp.json()
                 code = data.get("code")
                 if code == "0" and data.get("data"):
-                    details = data["data"][0].get("details", [])
+                    account_data = data["data"][0]
+                    total_eq = float(account_data.get("totalEq", 0.0))
+                    
+                    avail_cash = 0.0
+                    details = account_data.get("details", [])
                     for bal in details:
                         if bal.get("ccy") == ccy:
-                            return float(bal.get("availBal", 0.0))
-                    return float(data["data"][0].get("totalEq", 0.0))
-                return 0.0
+                            avail_cash = float(bal.get("availBal", 0.0))
+                            break
+
+                    return {
+                        "total_equity": total_eq,
+                        "available_cash": avail_cash
+                    }
+                return {"total_equity": 0.0, "available_cash": 0.0}
         except Exception as e:
-            logger.error(f"❌ [OKX-BALANCE-EXCEPTION] Błąd pobierania salda: {e}.")
-            return 0.0
+            logger.error(f"❌ [OKX-WALLET-EXCEPTION] Błąd odczytu portfela: {e}")
+            return {"total_equity": 0.0, "available_cash": 0.0}
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         # HYBRYDA: Najpierw błyskawiczny odczyt ze strumienia WebSocket w RAM
