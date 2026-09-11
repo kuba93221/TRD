@@ -1096,6 +1096,37 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                 await asyncio.sleep(60)
                 continue
 
+            # =========================================================================
+            # KROK 4: PAKIET OBRONY WYJŚCIA (RECONCILER DLA ZLECEŃ ALGO / OCO)
+            # =========================================================================
+            for inst in instruments:
+                pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
+                ticks = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
+                if not ticks:
+                    continue
+                pos_data = ticks[0]
+
+                if pos_data.get("status") == "WAITING_OCO" and "algo_id" in pos_data:
+                    algo_id = pos_data["algo_id"]
+                    algo_state = await okx_client.get_algo_order_state(algo_id)
+
+                    # Stan 'effective' oznacza, że OCO wciąż chroni pozycję na giełdzie.
+                    # Stan 'filled', 'canceled' lub 'order_failed' oznacza zakończenie cyklu ochrony.
+                    if algo_state in ["filled", "canceled", "order_failed"]:
+                        logger.info(f"🧹 [BREAKOUT-RECONCILE] Zlecenie OCO dla {inst['label']} zmieniło stan na '{algo_state}'. Zwalniam slot Alfa.")
+                        await redis_trade.push_historical_tick(pos_key, {"status": "CLOSED"}, max_elements=1)
+                        
+                        # Usunięcie z lokalnej listy active_keys jeśli istnieje
+                        target_key = f"{redis_trade.prefix}{pos_key}"
+                        if target_key in active_keys:
+                            active_keys.remove(target_key)
+
+                        await tg_dispatcher.push(
+                            f"🏁 <b>[BREAKOUT ENGINE: POSITION CLOSED]</b>\n"
+                            f"Instrument: <b>{inst['label']}</b>\n"
+                            f"Status OCO na giełdzie: <code>{algo_state}</code>. Slot Alfa zwolniony."
+                        )
+
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
