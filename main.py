@@ -1527,9 +1527,12 @@ def manual_analysis_trigger():
     asyncio.run_coroutine_threadsafe(run_async_pipeline(), BACKGROUND_LOOP)
     return jsonify({"status": "success", "message": f"Analiza rynków OKX ({QUOTE_CCY}) uruchomiona pomyślnie."}), 200
 
+# =========================================================================
+# KROK 5: BEZPIECZNY ENDPOINT LIKWIDACJI AWARYJNEJ (EMERGENCY FLUSH)
+# =========================================================================
 @app.route('/emergency-liquidate', methods=['GET', 'POST'])
 def emergency_liquidate_to_cash():
-    """Awaryjne zrzucenie wszystkich pozycji SPOT do USDC i wyczyszczenie kluczy Redis."""
+    """Awaryjne odwołanie zleceń, zrzucenie wszystkich pozycji SPOT do USDC i wyczyszczenie Redis."""
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
         return jsonify({"status": "error", "message": "Pętla bota nie jest aktywna."}), 500
 
@@ -1542,17 +1545,41 @@ def emergency_liquidate_to_cash():
                 session
             )
             
-            report = {"liquidated": []}
-            pairs_to_flush = [("BTC", 5), ("ETH", 4), ("SOL", 2), ("XRP", 2)]
-            for ccy, round_d in pairs_to_flush:
+            report = {"cancelled_orders": [], "liquidated": [], "redis_cleaned": False}
+            symbols_to_flush = [
+                ("BTC", f"BTC-{QUOTE_CCY}", 5), 
+                ("ETH", f"ETH-{QUOTE_CCY}", 4), 
+                ("SOL", f"SOL-{QUOTE_CCY}", 2), 
+                ("XRP", f"XRP-{QUOTE_CCY}", 2)
+            ]
+
+            # 1. ANULOWANIE WSZELKICH ZLECEŃ ZWYKŁYCH I ALGO PRZED WYPRZEDAŻĄ
+            for ccy, symbol, _ in symbols_to_flush:
+                try:
+                    # Anulowanie zwykłych zleceń oczekujących
+                    await client.rate_limiter.consume()
+                    req_p_pend = f"/api/v5/trade/orders-pending?instId={symbol}"
+                    headers = client._get_headers("GET", req_p_pend)
+                    async with session.get(f"{client.base_url}{req_p_pend}", headers=headers, timeout=4) as r_pend:
+                        d_pend = await r_pend.json()
+                        if d_pend.get("code") == "0":
+                            for ord_item in d_pend.get("data", []):
+                                o_id = ord_item.get("ordId")
+                                await client.cancel_order(symbol, o_id)
+                                report["cancelled_orders"].append({"symbol": symbol, "ordId": o_id})
+                except Exception as ex:
+                    logger.error(f"⚠️ [EMERGENCY] Błąd czyszczenia zleceń dla {symbol}: {ex}")
+
+            # 2. RYNKOWA WYPRZEDAŻ AKTYWÓW BAZOWYCH DO USDC
+            for ccy, symbol, round_d in symbols_to_flush:
                 bal = await client.get_account_balance(ccy)
                 if bal > 0.0001:
                     qty = round(bal * 0.999, round_d)
-                    symbol = f"{ccy}-{QUOTE_CCY}"
                     res = await client.execute_market_order(symbol, "sell", qty)
                     report["liquidated"].append({"symbol": symbol, "qty": qty, "res": res})
-                    logger.info(f"🚨 [EMERGENCY-FLUSH] Sprzedano {qty} {ccy} do {QUOTE_CCY}: {res}")
+                    logger.info(f"🚨 [EMERGENCY-FLUSH] Awaryjnie sprzedano {qty} {ccy} do {QUOTE_CCY}: {res}")
             
+            # 3. CZYSZCZENIE WSZYSTKICH KLUCZY W REDIS Z PREFIKSEM TRADE_
             url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:*"
             async with session.get(url_keys, headers=redis_trade.headers) as r_keys:
                 if r_keys.status == 200:
@@ -1560,13 +1587,14 @@ def emergency_liquidate_to_cash():
                     if keys:
                         del_payload = [["DEL"] + keys]
                         await session.post(f"{redis_trade.url}/pipeline", json=del_payload, headers=redis_trade.headers)
+                        report["redis_cleaned"] = True
                         logger.info(f"🧹 [EMERGENCY-FLUSH] Usunięto zablokowane klucze Redis: {keys}")
             
             return report
 
     fut = asyncio.run_coroutine_threadsafe(_execute_flush(), BACKGROUND_LOOP)
     try:
-        res = fut.result(timeout=15)
+        res = fut.result(timeout=20)
         return jsonify({"status": "success", "report": res}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
