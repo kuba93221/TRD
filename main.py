@@ -1085,12 +1085,23 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                             if target_k in active_keys:
                                 active_keys.remove(target_k)
 
+            # =========================================================================
+            # TWARDY BEZPIECZNIK BLOKADY POWTÓRNYCH ZAKUPÓW (MOMENTUM)
+            # =========================================================================
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
                 
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
-                if f"{redis_trade.prefix}{pos_key}" in active_keys:
+                clean_target = pos_key.replace(redis_trade.prefix, "")
+                
+                # 1. Sprawdzenie w pobranej liście kluczy
+                if any(clean_target in k for k in active_keys):
+                    continue
+
+                # 2. Bezpośrednie sprawdzenie stanu w Redis (zabezpieczenie przed opóźnieniem listy keys)
+                ticks_check = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
+                if ticks_check and ticks_check[0].get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
 
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
@@ -1260,14 +1271,24 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                             f"Status OCO na giełdzie: <code>{algo_state}</code>. Slot Alfa zwolniony."
                         )
 
+            # =========================================================================
+            # TWARDY BEZPIECZNIK BLOKADY POWTÓRNYCH ZAKUPÓW (BREAKOUT)
+            # =========================================================================
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
                 
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
-                if f"{redis_trade.prefix}{pos_key}" in active_keys:
+                clean_target = pos_key.replace(redis_trade.prefix, "")
+                
+                # 1. Sprawdzenie w pobranej liście kluczy
+                if any(clean_target in k for k in active_keys):
                     continue
 
+                # 2. Bezpośrednie sprawdzenie stanu w Redis (zabezpieczenie przed opóźnieniem listy keys)
+                ticks_check = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
+                if ticks_check and ticks_check[0].get("status") in ["OPEN", "WAITING_OCO"]:
+                    continue
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
                 if not candles_raw:
                     continue
