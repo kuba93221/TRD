@@ -38,6 +38,11 @@ GLOBAL_WS_FEED: Optional[Any] = None
 # Globalna definicja waluty kwotowanej
 QUOTE_CCY = "USDC"
 
+def floor_to_precision(value: float, precision: int) -> float:
+    """Rygorystyczne obcinanie wartości w dół bez ryzyka zaokrąglenia w górę."""
+    factor = 10 ** precision
+    return math.floor(value * factor) / factor
+
 # =========================================================================
 # SERWER MONITORINGU FLASK (URUCHAMIANY PRODUKCYJNIE NA RENDERZE)
 # =========================================================================
@@ -463,8 +468,6 @@ class MarketRegimeArbitrator:
 # KLIENT ASYNCHRONICZNY WEBSOCKET OKX (NASŁUCH CEN W CZASIE RZECZYWISTYM)
 # =========================================================================
 class OKXWebSocketPriceFeed:
-    """Lekki, asynchroniczny klient WebSocket do ciągłego nasłuchu cen SPOT."""
-    
     def __init__(self, session: aiohttp.ClientSession, is_sandbox: bool = True):
         self.session = session
         self.is_sandbox = is_sandbox
@@ -473,7 +476,6 @@ class OKXWebSocketPriceFeed:
         self._running: bool = False
 
     async def start_listener(self, symbols: list):
-        """Utrzymuje stałe połączenie, obsługuje ping-pong i odnawia sesję po błędzie."""
         self._running = True
         sub_args = [{"channel": "tickers", "instId": sym} for sym in symbols]
         subscribe_msg = json.dumps({"op": "subscribe", "args": sub_args})
@@ -544,7 +546,6 @@ class OKXSpotClient:
         return headers
 
     async def get_wallet_balances(self, ccy: str = "USDC") -> Dict[str, float]:
-        """Pobiera całkowity kapitał (totalEq) oraz wolną gotówkę (availBal) dla waluty kwotowanej."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return {"total_equity": 0.0, "available_cash": 0.0}
 
@@ -578,11 +579,6 @@ class OKXSpotClient:
             return {"total_equity": 0.0, "available_cash": 0.0}
 
     async def get_account_balance(self, ccy: str = "USDC") -> float:
-        """
-        Uniwersalna metoda pobierania salda dostępnego (availBal):
-        Dla USDC zwraca wolne środki gotówkowe.
-        Dla kryptowalut (BTC, ETH, SOL, XRP) zwraca faktyczną dostępną ilość w portfelu SPOT.
-        """
         if not self.api_key or not self.secret_key or not self.passphrase:
             return 0.0
 
@@ -607,6 +603,15 @@ class OKXSpotClient:
         except Exception as e:
             logger.error(f"❌ [OKX-BALANCE-EXCEPTION] Błąd pobierania salda dla {ccy}: {e}")
             return 0.0
+
+    async def wait_for_settled_balance(self, ccy: str, expected_min: float, max_attempts: int = 3) -> float:
+        """Odpytuje portfel w mikropętli (do 1.2s), czekając na faktyczne zaksięgowanie monet po zakupie."""
+        for attempt in range(max_attempts):
+            await asyncio.sleep(0.35 * (attempt + 1))
+            bal = await self.get_account_balance(ccy)
+            if bal >= expected_min * 0.98:
+                return bal
+        return await self.get_account_balance(ccy)
 
     async def get_market_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         if GLOBAL_WS_FEED:
@@ -731,7 +736,6 @@ class OKXSpotClient:
             return True
             
     async def get_algo_order_state(self, algo_id: str) -> Optional[str]:
-        """Sprawdza status zlecenia algorytmicznego (OCO) na OKX."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None
         await self.rate_limiter.consume()
@@ -882,12 +886,14 @@ async def run_async_pipeline():
 
             # SPRAWDZENIE ZAJĘTOŚCI KOSZYKA ALFA (MAX 2 POZYCJE)
             alpha_active_count = 0
+            active_keys = []
             try:
                 url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                 async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
                     if resp_k.status == 200:
                         data_k = await resp_k.json()
-                        alpha_active_count = len(data_k.get("result", []))
+                        active_keys = data_k.get("result", [])
+                        alpha_active_count = len(active_keys)
             except Exception as e:
                 logger.error(f"⚠️ [SLOTS CHECK ERROR] Błąd weryfikacji slotów ALFA: {e}")
 
@@ -901,6 +907,15 @@ async def run_async_pipeline():
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
+
+                pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
+                clean_target = pos_key.replace(redis_trade.prefix, "")
+                if any(clean_target in k for k in active_keys):
+                    continue
+
+                ticks_check = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
+                if ticks_check and ticks_check[0].get("status") in ["OPEN", "WAITING_OCO"]:
+                    continue
 
                 ticker = await inst["client"].get_market_ticker(inst["symbol"])
                 if not ticker:
@@ -956,12 +971,12 @@ async def run_async_pipeline():
                     sl_pct = max(0.01, sl_pct)
                     
                     position_value = min(risk_capital / sl_pct, total_balance * 0.25, available_cash * 0.95)
-                    calculated_qty = round(position_value / current_price, inst["round_digits"])
+                    calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
                     calculated_qty = max(inst["min_qty"], calculated_qty)
 
                     order_value_quote = calculated_qty * current_price
                     if order_value_quote < 11.0:
-                        calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
+                        calculated_qty = max(calculated_qty, floor_to_precision(11.0 / current_price, inst["round_digits"]))
                         calculated_qty = max(inst["min_qty"], calculated_qty)
 
                     if (calculated_qty * current_price) > available_cash:
@@ -976,22 +991,21 @@ async def run_async_pipeline():
                         order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
 
                         if order_res and order_res.get("code") == "0":
-                            pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                             await redis_trade.push_historical_tick(
                                 pos_key, 
                                 {"status": "OPEN", "type": "MEAN_REVERSION", "qty": calculated_qty, "buy_price": current_price, "time": time.time()}, 
                                 max_elements=1
                             )
                             alpha_active_count += 1
+                            active_keys.append(f"{redis_trade.prefix}{pos_key}")
 
                             price_tp = round(current_price + (stop_loss_distance * 1.5), inst["price_round"])
                             price_sl = round(current_price - stop_loss_distance, inst["price_round"])
 
-                            await asyncio.sleep(0.5)
                             base_ccy = inst["symbol"].split("-")[0]
-                            real_avail_bal = await inst["client"].get_account_balance(base_ccy)
-                            oco_qty = min(calculated_qty, real_avail_bal) if real_avail_bal > 0 else calculated_qty * 0.995
-                            oco_qty = round(oco_qty, inst["round_digits"])
+                            real_avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, calculated_qty)
+                            raw_oco_target = min(calculated_qty, real_avail_bal) if real_avail_bal > 0 else calculated_qty * 0.995
+                            oco_qty = floor_to_precision(raw_oco_target, inst["round_digits"])
                             oco_qty = max(inst["min_qty"], oco_qty)
 
                             oco_res = await inst["client"].execute_oco_protection(inst["symbol"], oco_qty, price_tp, price_sl)
@@ -1037,6 +1051,9 @@ async def run_async_pipeline():
                                 logger.critical(f"🚨 [MEAN-REV-FAIL-SAFE] OCO odrzucone dla {inst['label']} ({err_c}: {err_m})! Natychmiastowa likwidacja...")
                                 await inst["client"].execute_market_order(inst["symbol"], "sell", calculated_qty)
                                 await redis_trade.push_historical_tick(pos_key, {"status": "CLOSED"}, max_elements=1)
+                                target_k = f"{redis_trade.prefix}{pos_key}"
+                                if target_k in active_keys:
+                                    active_keys.remove(target_k)
                         else:
                             err_c = order_res.get("code") if order_res else "ERR"
                             err_m = order_res.get("msg") if order_res else "Connection error"
@@ -1099,7 +1116,7 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                 if any(clean_target in k for k in active_keys):
                     continue
 
-                # 2. Bezpośrednie sprawdzenie stanu w Redis (zabezpieczenie przed opóźnieniem listy keys)
+                # 2. Bezpośrednie sprawdzenie stanu w Redis
                 ticks_check = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
                 if ticks_check and ticks_check[0].get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
@@ -1133,11 +1150,11 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                         sl_pct = 0.02
                         position_value = min(risk_capital / sl_pct, total_balance * 0.25, available_cash * 0.95)
                         
-                        calculated_qty = round(position_value / current_price, inst["round_digits"])
+                        calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
                         calculated_qty = max(inst["min_qty"], calculated_qty)
                         
                         if (calculated_qty * current_price) < 11.0:
-                            calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
+                            calculated_qty = max(calculated_qty, floor_to_precision(11.0 / current_price, inst["round_digits"]))
                             calculated_qty = max(inst["min_qty"], calculated_qty)
 
                         if (calculated_qty * current_price) > available_cash:
@@ -1163,12 +1180,11 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                             price_tp = round(current_price * 1.03, inst["price_round"])
                             price_sl = round(current_price * 0.98, inst["price_round"])
                             
-                            await asyncio.sleep(0.5)
                             base_ccy = inst["symbol"].split("-")[0]
-                            real_avail_bal = await inst["client"].get_account_balance(base_ccy)
+                            real_avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, calculated_qty)
                             
-                            oco_qty = min(calculated_qty, real_avail_bal) if real_avail_bal > 0 else calculated_qty * 0.995
-                            oco_qty = round(oco_qty, inst["round_digits"])
+                            raw_oco_target = min(calculated_qty, real_avail_bal) if real_avail_bal > 0 else calculated_qty * 0.995
+                            oco_qty = floor_to_precision(raw_oco_target, inst["round_digits"])
                             oco_qty = max(inst["min_qty"], oco_qty)
                             
                             oco_res = await inst["client"].execute_oco_protection(inst["symbol"], oco_qty, price_tp, price_sl)
@@ -1209,8 +1225,9 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                                 logger.critical(f"🚨 [MOMENTUM-FAIL-SAFE] OCO odrzucone dla {inst['label']} ({err_c}: {err_m})! Likwidacja...")
                                 await inst["client"].execute_market_order(inst["symbol"], "sell", calculated_qty)
                                 await redis_trade.push_historical_tick(pos_key, {"status": "CLOSED"}, max_elements=1)
-                                if f"{redis_trade.prefix}{pos_key}" in active_keys:
-                                    active_keys.remove(f"{redis_trade.prefix}{pos_key}")
+                                target_k = f"{redis_trade.prefix}{pos_key}"
+                                if target_k in active_keys:
+                                    active_keys.remove(target_k)
                         else:
                             err_c = order_res.get("code") if order_res else "ERR"
                             err_m = order_res.get("msg") if order_res else "Connection error"
@@ -1285,10 +1302,11 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                 if any(clean_target in k for k in active_keys):
                     continue
 
-                # 2. Bezpośrednie sprawdzenie stanu w Redis (zabezpieczenie przed opóźnieniem listy keys)
+                # 2. Bezpośrednie sprawdzenie stanu w Redis
                 ticks_check = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
                 if ticks_check and ticks_check[0].get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
+
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
                 if not candles_raw:
                     continue
@@ -1314,11 +1332,11 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                         sl_pct = 0.02
                         position_value = min(risk_capital / sl_pct, total_balance * 0.25, available_cash * 0.95)
                         
-                        calculated_qty = round(position_value / current_price, inst["round_digits"])
+                        calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
                         calculated_qty = max(inst["min_qty"], calculated_qty)
                         
                         if (calculated_qty * current_price) < 11.0:
-                            calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
+                            calculated_qty = max(calculated_qty, floor_to_precision(11.0 / current_price, inst["round_digits"]))
                             calculated_qty = max(inst["min_qty"], calculated_qty)
 
                         if (calculated_qty * current_price) > available_cash:
@@ -1345,13 +1363,11 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                             price_tp = round(current_price * 1.04, inst["price_round"])
                             price_sl = round(current_price * 0.98, inst["price_round"])
                             
-                            # DYNAMICZNY ODCZYT RZECZYWISTEGO SALDA DLA OCO
-                            await asyncio.sleep(0.5)
                             base_ccy = inst["symbol"].split("-")[0]
-                            real_avail_bal = await inst["client"].get_account_balance(base_ccy)
+                            real_avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, calculated_qty)
                             
-                            oco_qty = min(calculated_qty, real_avail_bal) if real_avail_bal > 0 else calculated_qty * 0.995
-                            oco_qty = round(oco_qty, inst["round_digits"])
+                            raw_oco_target = min(calculated_qty, real_avail_bal) if real_avail_bal > 0 else calculated_qty * 0.995
+                            oco_qty = floor_to_precision(raw_oco_target, inst["round_digits"])
                             oco_qty = max(inst["min_qty"], oco_qty)
                             
                             logger.info(f"📦 [BREAKOUT-OCO-CALC] Kupiono: {calculated_qty} | W portfelu: {real_avail_bal} | Do OCO: {oco_qty} {base_ccy}")
@@ -1395,8 +1411,9 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                                 
                                 await inst["client"].execute_market_order(inst["symbol"], "sell", calculated_qty)
                                 await redis_trade.push_historical_tick(pos_key, {"status": "CLOSED"}, max_elements=1)
-                                if f"{redis_trade.prefix}{pos_key}" in active_keys:
-                                    active_keys.remove(f"{redis_trade.prefix}{pos_key}")
+                                target_k = f"{redis_trade.prefix}{pos_key}"
+                                if target_k in active_keys:
+                                    active_keys.remove(target_k)
 
                                 await tg_dispatcher.push(
                                     f"🚨 <b>[FAIL-SAFE KILL: POZYCJA ZLIKWIDOWANA]</b>\n"
@@ -1448,7 +1465,7 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
 
                     if state == "filled":
                         raw_qty = float(active_pos["qty"])
-                        qty_to_sell = round(raw_qty * 0.998, inst["round_digits"])
+                        qty_to_sell = floor_to_precision(raw_qty * 0.998, inst["round_digits"])
                         qty_to_sell = max(inst["min_qty"], qty_to_sell)
 
                         tp_price = float(active_pos["tp_price"])
@@ -1560,11 +1577,11 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
                     sl_pct = 0.015
                     position_value = min(risk_capital / sl_pct, total_balance * 0.15, available_cash * 0.95)
 
-                    calculated_qty = round(position_value / price_buy, inst["round_digits"])
+                    calculated_qty = floor_to_precision(position_value / price_buy, inst["round_digits"])
                     calculated_qty = max(inst["min_qty"], calculated_qty)
 
                     if (calculated_qty * price_buy) < 11.0:
-                        calculated_qty = max(calculated_qty, round(11.0 / price_buy, inst["round_digits"]))
+                        calculated_qty = max(calculated_qty, floor_to_precision(11.0 / price_buy, inst["round_digits"]))
                         calculated_qty = max(inst["min_qty"], calculated_qty)
 
                     if (calculated_qty * price_buy) > available_cash:
@@ -1721,7 +1738,7 @@ def emergency_liquidate_to_cash():
             for ccy, symbol, round_d in symbols_to_flush:
                 bal = await client.get_account_balance(ccy)
                 if bal > 0.0001:
-                    qty = round(bal * 0.999, round_d)
+                    qty = floor_to_precision(bal * 0.999, round_d)
                     res = await client.execute_market_order(symbol, "sell", qty)
                     report["liquidated"].append({"symbol": symbol, "qty": qty, "res": res})
                     logger.info(f"🚨 [EMERGENCY-FLUSH] Awaryjnie sprzedano {qty} {ccy} do {QUOTE_CCY}: {res}")
