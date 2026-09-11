@@ -1072,7 +1072,7 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 3: WORKER BREAKOUT W TLE (KOSZYK ALFA: MAX 2)
+# STRATEGIA 3: WORKER BREAKOUT W TLE (KOSZYK ALFA: MAX 2) - PAKIET OBRONY WEJŚCIA
 # =========================================================================
 async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_client):
     logger.info("💥 [BREAKOUT-WORKER] Uruchomiono niezależny wątek Breakout w tle.")
@@ -1100,7 +1100,8 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
                 
-                if f"{redis_trade.prefix}POS_ACTIVE:ALPHA:{inst['label']}" in active_keys:
+                pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
+                if f"{redis_trade.prefix}{pos_key}" in active_keys:
                     continue
 
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
@@ -1115,11 +1116,18 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                     
                     if brk_metrics["signal"]:
                         logger.info(f"🚨 [BREAKOUT-TRIGGER] Wykryto potwierdzone wybicie dla {inst['label']}!")
-                        total_balance = await inst["client"].get_account_balance(QUOTE_CCY)
                         
+                        wallet = await inst["client"].get_wallet_balances(QUOTE_CCY)
+                        total_balance = wallet.get("total_equity", 0.0)
+                        available_cash = wallet.get("available_cash", 0.0)
+                        
+                        if available_cash < 11.0:
+                            logger.warning(f"⚠️ [BREAKOUT-LIQUIDITY] Wolna gotówka ({available_cash} {QUOTE_CCY}) < 11.0. Wstrzymuję zakup {inst['label']}.")
+                            continue
+
                         risk_capital = total_balance * 0.01
                         sl_pct = 0.02
-                        position_value = min(risk_capital / sl_pct, total_balance * 0.25)
+                        position_value = min(risk_capital / sl_pct, total_balance * 0.25, available_cash * 0.95)
                         
                         calculated_qty = round(position_value / current_price, inst["round_digits"])
                         calculated_qty = max(inst["min_qty"], calculated_qty)
@@ -1128,29 +1136,86 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                             calculated_qty = max(calculated_qty, round(11.0 / current_price, inst["round_digits"]))
                             calculated_qty = max(inst["min_qty"], calculated_qty)
 
+                        if (calculated_qty * current_price) > available_cash:
+                            logger.warning(f"⚠️ [BREAKOUT-MARGIN] Zlecenie przekracza dostępne saldo gotówki. Pomijam {inst['label']}.")
+                            continue
+
                         order_res = await inst["client"].execute_market_order(inst["symbol"], "buy", calculated_qty)
                         
                         if order_res and order_res.get("code") == "0":
+                            # 1. ATOMOWY ZAPIS STANU DO REDIS (NATYCHMIAST PO KUPNIE - BLOKUJE KARUZELĘ)
+                            await redis_trade.push_historical_tick(
+                                pos_key, 
+                                {
+                                    "status": "OPEN", 
+                                    "type": "BREAKOUT", 
+                                    "qty": calculated_qty, 
+                                    "buy_price": current_price, 
+                                    "time": time.time()
+                                }, 
+                                max_elements=1
+                            )
+                            active_keys.append(f"{redis_trade.prefix}{pos_key}")
+                            logger.info(f"🔒 [BREAKOUT-STATE-LOCKED] Pozycja {inst['label']} atomowo zabezpieczona w Redis.")
+
                             price_tp = round(current_price * 1.04, inst["price_round"])
                             price_sl = round(current_price * 0.98, inst["price_round"])
                             
-                            await asyncio.sleep(0.3)
-                            await inst["client"].execute_oco_protection(inst["symbol"], calculated_qty, price_tp, price_sl)
-                            await redis_trade.push_historical_tick(
-                                f"POS_ACTIVE:ALPHA:{inst['label']}", 
-                                {"status": "OPEN", "type": "BREAKOUT", "time": time.time()}, 
-                                max_elements=1
-                            )
-                            active_keys.append(f"{redis_trade.prefix}POS_ACTIVE:ALPHA:{inst['label']}")
+                            # 2. BUFOR PROWIZJI DLA OCO (0.995) LIKWIDUJE BŁĄD 51008
+                            oco_qty = round(calculated_qty * 0.995, inst["round_digits"])
+                            oco_qty = max(inst["min_qty"], oco_qty)
                             
-                            await tg_dispatcher.push(
-                                f"💥 <b>[BREAKOUT ENGINE: TRADE DEPLOYED]</b>\n"
-                                f"──────────────────────────────\n"
-                                f"📈 Instrument: <b>{inst['label']}</b> | Bw: <code>{brk_metrics['bandwidth']}</code>\n"
-                                f"💰 Wejście: <b>{current_price} {QUOTE_CCY}</b>\n"
-                                f"📦 Wielkość: <b>{calculated_qty}</b>\n"
-                                f"🎯 TP (+4%): <code>{price_tp} {QUOTE_CCY}</code> | 🛑 SL (-2%): <code>{price_sl} {QUOTE_CCY}</code>"
-                            )
+                            await asyncio.sleep(0.3)
+                            oco_res = await inst["client"].execute_oco_protection(inst["symbol"], oco_qty, price_tp, price_sl)
+                            
+                            # Weryfikacja czy OCO zostało faktycznie przyjęte przez silnik Algo
+                            oco_success = False
+                            algo_id = ""
+                            if oco_res and oco_res.get("code") == "0" and oco_res.get("data"):
+                                item = oco_res["data"][0]
+                                if item.get("sCode") == "0" and item.get("algoId"):
+                                    oco_success = True
+                                    algo_id = item["algoId"]
+
+                            if oco_success:
+                                # Uzupełniamy stan w Redis o ID zlecenia obronnego OCO
+                                await redis_trade.push_historical_tick(
+                                    pos_key, 
+                                    {
+                                        "status": "WAITING_OCO", 
+                                        "algo_id": algo_id, 
+                                        "qty": oco_qty, 
+                                        "buy_price": current_price, 
+                                        "tp_price": price_tp, 
+                                        "sl_price": price_sl, 
+                                        "time": time.time()
+                                    }, 
+                                    max_elements=1
+                                )
+                                await tg_dispatcher.push(
+                                    f"💥 <b>[BREAKOUT ENGINE: TRADE DEPLOYED]</b>\n"
+                                    f"──────────────────────────────\n"
+                                    f"📈 Instrument: <b>{inst['label']}</b> | Bw: <code>{brk_metrics['bandwidth']}</code>\n"
+                                    f"💰 Wejście: <b>{current_price} {QUOTE_CCY}</b>\n"
+                                    f"📦 Wielkość: <b>{oco_qty}</b> (Ochrona OCO aktywna)\n"
+                                    f"🎯 TP (+4%): <code>{price_tp} {QUOTE_CCY}</code> | 🛑 SL (-2%): <code>{price_sl} {QUOTE_CCY}</code>"
+                                )
+                            else:
+                                # 3. BEZPIECZNIK FAIL-SAFE KILL (Zrzucenie do gotówki w razie odrzucenia OCO)
+                                err_c = oco_res.get("code") if oco_res else "ERR"
+                                err_m = oco_res.get("msg") if oco_res else "Timeout OCO"
+                                logger.critical(f"🚨 [FAIL-SAFE-TRIGGERED] OCO odrzucone dla {inst['label']} (Kod: {err_c} | Msg: {err_m})! Awaryjna likwidacja do gotówki...")
+                                
+                                await inst["client"].execute_market_order(inst["symbol"], "sell", calculated_qty)
+                                await redis_trade.push_historical_tick(pos_key, {"status": "CLOSED"}, max_elements=1)
+                                if f"{redis_trade.prefix}{pos_key}" in active_keys:
+                                    active_keys.remove(f"{redis_trade.prefix}{pos_key}")
+
+                                await tg_dispatcher.push(
+                                    f"🚨 <b>[FAIL-SAFE KILL: POZYCJA ZLIKWIDOWANA]</b>\n"
+                                    f"Pozycja <b>{inst['label']}</b> została natychmiast zamknięta zleceniem Market z powodu błędu zlecenia obronnego OCO.\n"
+                                    f"Błąd OKX: <code>{err_c}</code> - <i>{err_m}</i>"
+                                )
                         else:
                             err_code = order_res.get("code") if order_res else "BRAK_ODPOWIEDZI"
                             err_msg = order_res.get("msg") if order_res else "Timeout lub błąd połączenia"
@@ -1159,7 +1224,6 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
             logger.error(f"❌ [BREAKOUT-ERROR] Błąd w workerze Breakout: {e}")
         
         await asyncio.sleep(180)
-
 # =========================================================================
 # STRATEGIA 4: WORKER GRID TRADING (DEDYKOWANY KOSZYK GRID: MAX 3 SLOTY)
 # =========================================================================
