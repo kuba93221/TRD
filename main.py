@@ -700,7 +700,33 @@ class OKXSpotClient:
         except Exception as e:
             logger.error(f"❌ [OKX-PENDING-CHECK-ERROR] Błąd sprawdzania otwartych zleceń {symbol}: {e}")
             return True
+            
+    async def get_algo_order_state(self, algo_id: str) -> Optional[str]:
+        """
+        [KROK 2 PRODUKCJA] Sprawdza status zlecenia algorytmicznego (OCO / SL / TP) na OKX.
+        Zwraca: 'effective' (aktywne), 'filled' (zrealizowane), 'canceled' (anulowane) lub None.
+        """
+        if not self.api_key or not self.secret_key or not self.passphrase:
+            return None
+        await self.rate_limiter.consume()
 
+        request_path = f"/api/v5/trade/order-algo?algoId={algo_id}"
+        url = f"{self.base_url}{request_path}"
+        headers = self._get_headers("GET", request_path)
+
+        try:
+            async with self.session.get(url, headers=headers, timeout=5) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if data.get("code") == "0" and data.get("data"):
+                    # OKX zwraca stan w polu 'state' (np. 'effective', 'filled', 'canceled')
+                    return data["data"][0].get("state")
+                return None
+        except Exception as e:
+            logger.error(f"❌ [OKX-ALGO-STATE-ERROR] Błąd sprawdzania statusu zlecenia Algo {algo_id}: {e}")
+            return None
+            
     async def get_order_state(self, symbol: str, ord_id: str) -> Optional[str]:
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None
