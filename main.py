@@ -970,7 +970,8 @@ async def run_async_pipeline():
                     sl_pct = (stop_loss_distance / current_price) if current_price > 0 else 0.02
                     sl_pct = max(0.01, sl_pct)
                     
-                    position_value = min(risk_capital / sl_pct, total_balance * 0.25, available_cash * 0.95)
+                    safe_cash = max(0.0, available_cash - 2.0)
+                    position_value = min(risk_capital / sl_pct, total_balance * 0.25, safe_cash * 0.95)
                     calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
                     calculated_qty = max(inst["min_qty"], calculated_qty)
 
@@ -1102,9 +1103,7 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                             if target_k in active_keys:
                                 active_keys.remove(target_k)
 
-            # =========================================================================
             # TWARDY BEZPIECZNIK BLOKADY POWTÓRNYCH ZAKUPÓW (MOMENTUM)
-            # =========================================================================
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
@@ -1112,11 +1111,9 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                 clean_target = pos_key.replace(redis_trade.prefix, "")
                 
-                # 1. Sprawdzenie w pobranej liście kluczy
                 if any(clean_target in k for k in active_keys):
                     continue
 
-                # 2. Bezpośrednie sprawdzenie stanu w Redis
                 ticks_check = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
                 if ticks_check and ticks_check[0].get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
@@ -1148,7 +1145,8 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
 
                         risk_capital = total_balance * 0.01
                         sl_pct = 0.02
-                        position_value = min(risk_capital / sl_pct, total_balance * 0.25, available_cash * 0.95)
+                        safe_cash = max(0.0, available_cash - 2.0)
+                        position_value = min(risk_capital / sl_pct, total_balance * 0.25, safe_cash * 0.95)
                         
                         calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
                         calculated_qty = max(inst["min_qty"], calculated_qty)
@@ -1288,9 +1286,7 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                             f"Status OCO na giełdzie: <code>{algo_state}</code>. Slot Alfa zwolniony."
                         )
 
-            # =========================================================================
             # TWARDY BEZPIECZNIK BLOKADY POWTÓRNYCH ZAKUPÓW (BREAKOUT)
-            # =========================================================================
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
@@ -1298,11 +1294,9 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                 clean_target = pos_key.replace(redis_trade.prefix, "")
                 
-                # 1. Sprawdzenie w pobranej liście kluczy
                 if any(clean_target in k for k in active_keys):
                     continue
 
-                # 2. Bezpośrednie sprawdzenie stanu w Redis
                 ticks_check = await redis_trade.get_historical_ticks(pos_key, max_elements=1)
                 if ticks_check and ticks_check[0].get("status") in ["OPEN", "WAITING_OCO"]:
                     continue
@@ -1330,7 +1324,8 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
 
                         risk_capital = total_balance * 0.01
                         sl_pct = 0.02
-                        position_value = min(risk_capital / sl_pct, total_balance * 0.25, available_cash * 0.95)
+                        safe_cash = max(0.0, available_cash - 2.0)
+                        position_value = min(risk_capital / sl_pct, total_balance * 0.25, safe_cash * 0.95)
                         
                         calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
                         calculated_qty = max(inst["min_qty"], calculated_qty)
@@ -1575,7 +1570,8 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
 
                     risk_capital = total_balance * 0.01
                     sl_pct = 0.015
-                    position_value = min(risk_capital / sl_pct, total_balance * 0.15, available_cash * 0.95)
+                    safe_cash = max(0.0, available_cash - 2.0)
+                    position_value = min(risk_capital / sl_pct, total_balance * 0.15, safe_cash * 0.95)
 
                     calculated_qty = floor_to_precision(position_value / price_buy, inst["round_digits"])
                     calculated_qty = max(inst["min_qty"], calculated_qty)
