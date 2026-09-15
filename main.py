@@ -2149,8 +2149,13 @@ def export_analytics_safe_json():
         headers = {"Authorization": f"Bearer {r_tok}", "Content-Type": "application/json"}
         req_keys = Request(f"{r_url}/keys/TRADE_ANALYTICS:*", headers=headers)
         with urlopen(req_keys, timeout=10) as resp:
-            keys_data = json.loads(resp.read().decode('utf-8'))
-            r_keys = keys_data.get("result", [])
+            raw_keys_resp = json.loads(resp.read().decode('utf-8'))
+            if isinstance(raw_keys_resp, dict):
+                r_keys = raw_keys_resp.get("result", [])
+            elif isinstance(raw_keys_resp, list):
+                r_keys = raw_keys_resp
+            else:
+                r_keys = []
 
         if not r_keys:
             return jsonify({"status": "success", "trading_data": []}), 200
@@ -2163,18 +2168,30 @@ def export_analytics_safe_json():
             method="POST"
         )
         with urlopen(req_pipe, timeout=15) as resp:
-            pipeline_result = json.loads(resp.read().decode('utf-8')).get("result", [])
+            raw_pipe_resp = json.loads(resp.read().decode('utf-8'))
 
-        r_values = pipeline_result[0] if pipeline_result else []
+        r_values = []
+        if isinstance(raw_pipe_resp, list) and len(raw_pipe_resp) > 0:
+            first_cmd = raw_pipe_resp[0]
+            if isinstance(first_cmd, dict):
+                r_values = first_cmd.get("result", [])
+            elif isinstance(first_cmd, list):
+                r_values = first_cmd
+
         trading_output = []
         for index, key in enumerate(r_keys):
             if index >= len(r_values):
                 break
             parts = key.split(":")
+            val = r_values[index]
+            try:
+                val_int = int(val) if val is not None else 0
+            except (ValueError, TypeError):
+                val_int = 0
             trading_output.append({
                 "data": parts[2] if len(parts) > 2 else "??",
                 "metryka": parts[1],
-                "wartosc": int(r_values[index] or 0)
+                "wartosc": val_int
             })
         return jsonify({"status": "success", "trading_count": len(trading_output), "trading_data": trading_output}), 200
     except Exception as e:
