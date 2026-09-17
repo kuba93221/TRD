@@ -18,19 +18,19 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 # =========================================================================
-# SYSTEMOWY MODUŁ OBSERVABILITY & GLOBAL CONTEXT (WERSJA v11.1)
+# SYSTEMOWY MODUŁ OBSERVABILITY & GLOBAL CONTEXT (WERSJA v11.2)
 # =========================================================================
 LOG_LEVEL_CONFIG = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO),
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Algorithmic_Trading_Engine_v11.1_OKX_PRODUCTION")
+logger = logging.getLogger("Algorithmic_Trading_Engine_v11.2_OKX_PRODUCTION")
 
 # Globalny przełącznik środowiska: True = Sandbox (Demo), False = Live (Prawdziwe Subkonto)
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
 
-logger.info(f"⚙️ [SYSTEM-INIT] Uruchamianie silnika v11.1 [3 SLOTY ALFA | DUAL TIME-STOP | LIVE: {not IS_SANDBOX}]")
+logger.info(f"⚙️ [SYSTEM-INIT] Uruchamianie silnika v11.2 [3 SLOTY ALFA | DUAL TIME-STOP | LIVE: {not IS_SANDBOX}]")
 
 BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
 PIPELINE_LOCK: Optional[asyncio.Lock] = None
@@ -901,13 +901,21 @@ class OKXSpotClient:
                 if data.get("code") == "0" and data.get("data"):
                     item = data["data"][0]
                     s_code = str(item.get("sCode", ""))
-                    # "0" = anulowano pomyślnie
-                    # "51410" = zlecenie nie istnieje, zostało już anulowane lub zrealizowane na giełdzie
-                    # "51400" / "51401" = zlecenie w trakcie anulowania lub anulowane
-                    # "51415" = zlecenie zostało już wyzwolone (np. uderzyło w SL/TP)
-                    if s_code in ("0", "51410", "51400", "51401", "51415", "51402"):
+                    
+                    # Słownik bezpiecznych stanów terminalnych OKX:
+                    SAFE_TERMINAL_CODES = (
+                        "0",      # Sukces: zlecenie anulowane w tej milisekundzie
+                        "51410",  # Sukces: zlecenie już nie istnieje (wypełnione lub anulowane wcześniej)
+                        "51401",  # Sukces: zlecenie zostało unieważnione
+                        "51415",  # Sukces: zlecenie zostało już wyzwolone (uderzyło w SL/TP)
+                        "51402",  # Sukces: brak zlecenia w rejestrze
+                        "51400"   # Sukces: zlecenie w trakcie procedury zdejmowania
+                    )
+                    
+                    if s_code in SAFE_TERMINAL_CODES:
                         return True
-                    logger.warning(f"⚠️ [OKX-ALGO-CANCEL] OKX zwrócił sCode {s_code}: {item.get('sMsg')}")
+                        
+                    logger.warning(f"⚠️ [OKX-ALGO-CANCEL] OKX zwrócił nieobsługiwany sCode {s_code}: {item.get('sMsg')}")
                     return False
                 return False
         except Exception as e:
@@ -977,7 +985,7 @@ async def run_async_pipeline():
             total_balance = wallet.get("total_equity", 0.0)
             available_cash = wallet.get("available_cash", 0.0)
 
-            # [AKTUALIZACJA v11.1] SPRAWDZENIE ZAJĘTOŚCI KOSZYKA ALFA (MAX 3 POZYCJE)
+            # [AKTUALIZACJA v11.2] SPRAWDZENIE ZAJĘTOŚCI KOSZYKA ALFA (MAX 3 POZYCJE)
             alpha_active_count = 0
             active_keys = []
             try:
@@ -1016,40 +1024,32 @@ async def run_async_pipeline():
                         logger.warning(f"⏳ [TIME-STOP EXPIRED] Pozycja {inst['label']} przekroczyła {round(max_timeout/3600, 1)}h (trwa {round(elapsed_time/3600, 1)}h). Likwidacja awaryjna do gotówki...")
                         cancel_ok = await okx_client.cancel_algo_order(inst["symbol"], algo_id)
                         if not cancel_ok:
-                            logger.error(f"⚠️ [MEAN-REV-TIME-STOP] Brak potwierdzenia odwołania OCO {algo_id} dla {inst['label']}. Ponawiam w kolejnym cyklu.")
-                            continue
+                            logger.warning(f"⚠️ [TIME-STOP FORCE CLEANUP] Zlecenie OCO {algo_id} nie istnieje na giełdzie. Wymuszam czyszczenie sieroty w Redis dla {inst['label']}.")
 
                         base_ccy = inst["symbol"].split("-")[0]
                         qty_to_sell = float(pos_data.get("qty", 0.0))
-                        avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=3)
-                        sell_qty = floor_to_precision(min(qty_to_sell, avail_bal) if avail_bal > 0 else qty_to_sell, inst["round_digits"])
-                        sell_qty = max(inst["min_qty"], sell_qty)
-
-                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", sell_qty)
-                        if sell_res and sell_res.get("code") == "0":
+                        avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=2)
+                        
+                        if avail_bal < inst["min_qty"]:
+                            logger.info(f"🧹 [SLOT CLEANUP] Brak tokenów {base_ccy} na giełdzie. Czyszczę martwy wpis w Redis dla {inst['label']}.")
                             await redis_trade.delete_key(pos_key)
                             target_k = f"{redis_trade.prefix}{pos_key}"
                             if target_k in active_keys:
                                 active_keys.remove(target_k)
                             alpha_active_count = max(0, alpha_active_count - 1)
+                            continue
 
-                            t_now = await okx_client.get_market_ticker(inst["symbol"])
-                            curr_p = t_now.get("last", 0.0) if t_now else float(pos_data.get("buy_price", 0.0))
-                            buy_p = float(pos_data.get("buy_price", curr_p))
-                            pnl_net = round(((curr_p - buy_p) * sell_qty) - (curr_p * sell_qty * 0.0016), 2)
+                        sell_qty = floor_to_precision(min(qty_to_sell, avail_bal), inst["round_digits"])
+                        sell_qty = max(inst["min_qty"], sell_qty)
 
-                            await tg.push(
-                                f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
-                                f"──────────────────────────────\n"
-                                f"📈 Strategia: <b>MEAN REVERSION</b>\n"
-                                f"⏱️ Czas trwania: <b>{round(elapsed_time / 3600.0, 1)}h / {round(max_timeout / 3600.0, 1)}h</b>\n"
-                                f"💰 Zamknięto po: <b>{curr_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
-                                f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY}</b>\n"
-                                f"──────────────────────────────\n"
-                                f"🔓 <b>Slot ALFA natychmiast zwolniony. Gotówka uwolniona.</b>"
-                            )
-                        else:
-                            logger.error(f"❌ [MEAN-REV-SELL-FAIL] Błąd sprzedaży rynkowej dla {inst['label']}: {sell_res}")
+                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", sell_qty)
+                        await redis_trade.delete_key(pos_key)
+                        target_k = f"{redis_trade.prefix}{pos_key}"
+                        if target_k in active_keys:
+                            active_keys.remove(target_k)
+                        alpha_active_count = max(0, alpha_active_count - 1)
+
+                        logger.info(f"🔓 [SLOT-FREED] Pomyślnie wyczyszczono zablokowany slot dla {inst['label']}.")
                         continue
 
                     if algo_state in ["filled", "canceled", "order_failed"]:
@@ -1103,7 +1103,7 @@ async def run_async_pipeline():
                                     f"Slot zwolniony. Kapitał zabezpieczony."
                                 )
 
-            # SKANOWANIE NOWYCH WEJŚĆ W STRATEGII MEAN REVERSION
+            # SKANOWANIE NOWYCH WEjŚĆ W STRATEGII MEAN REVERSION
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
@@ -1150,7 +1150,7 @@ async def run_async_pipeline():
                         logger.info(f"⚠️ [{inst['label']}] Blokada: BandWidth skrajnie niski ({bandwidth}). Rynek w kompresji.")
                         continue
 
-                    # [AKTUALIZACJA v11.1] TWARDY LIMIT 3 SLOTÓW ALFA
+                    # [AKTUALIZACJA v11.2] TWARDY LIMIT 3 SLOTÓW ALFA
                     if alpha_active_count >= 3:
                         logger.info(f"🛡️ [ALPHA LIMIT] Pozycje ALFA: {alpha_active_count}/3. Blokada nowych zakupów dla {inst['label']}.")
                         continue
@@ -1165,7 +1165,6 @@ async def run_async_pipeline():
                     sl_pct = max(0.01, sl_pct)
                     
                     safe_cash = max(0.0, available_cash - 2.0)
-                    # [AKTUALIZACJA v11.1] ALOKACJA KAPITAŁOWA ZREDUKOWANA DO 18% (OK. 62-64 USDC)
                     position_value = min(risk_capital / sl_pct, total_balance * 0.18, safe_cash * 0.95)
                     calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
                     calculated_qty = max(inst["min_qty"], calculated_qty)
@@ -1295,39 +1294,30 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                         logger.warning(f"⏳ [TIME-STOP EXPIRED] Pozycja Momentum {inst['label']} przekroczyła {round(max_timeout/3600, 1)}h. Wymuszone wyjście...")
                         cancel_ok = await okx_client.cancel_algo_order(inst["symbol"], algo_id)
                         if not cancel_ok:
-                            logger.error(f"⚠️ [MOMENTUM-TIME-STOP] Brak potwierdzenia odwołania OCO {algo_id} dla {inst['label']}. Ponawiam w kolejnym cyklu.")
-                            continue
+                            logger.warning(f"⚠️ [TIME-STOP FORCE CLEANUP] Zlecenie OCO {algo_id} nie istnieje na giełdzie. Wymuszam czyszczenie sieroty w Redis dla {inst['label']}.")
 
                         base_ccy = inst["symbol"].split("-")[0]
                         qty_to_sell = float(pos_data.get("qty", 0.0))
-                        avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=3)
-                        sell_qty = floor_to_precision(min(qty_to_sell, avail_bal) if avail_bal > 0 else qty_to_sell, inst["round_digits"])
-                        sell_qty = max(inst["min_qty"], sell_qty)
-
-                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", sell_qty)
-                        if sell_res and sell_res.get("code") == "0":
+                        avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=2)
+                        
+                        if avail_bal < inst["min_qty"]:
+                            logger.info(f"🧹 [SLOT CLEANUP] Brak tokenów {base_ccy} na giełdzie. Czyszczę martwy wpis w Redis dla {inst['label']}.")
                             await redis_trade.delete_key(pos_key)
                             target_k = f"{redis_trade.prefix}{pos_key}"
                             if target_k in active_keys:
                                 active_keys.remove(target_k)
+                            continue
 
-                            t_now = await okx_client.get_market_ticker(inst["symbol"])
-                            curr_p = t_now.get("last", 0.0) if t_now else float(pos_data.get("buy_price", 0.0))
-                            buy_p = float(pos_data.get("buy_price", curr_p))
-                            pnl_net = round(((curr_p - buy_p) * sell_qty) - (curr_p * sell_qty * 0.0016), 2)
+                        sell_qty = floor_to_precision(min(qty_to_sell, avail_bal), inst["round_digits"])
+                        sell_qty = max(inst["min_qty"], sell_qty)
 
-                            await tg_dispatcher.push(
-                                f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
-                                f"──────────────────────────────\n"
-                                f"📈 Strategia: <b>MOMENTUM</b>\n"
-                                f"⏱️ Czas trwania: <b>{round(elapsed_time / 3600.0, 1)}h / {round(max_timeout / 3600.0, 1)}h</b>\n"
-                                f"💰 Zamknięto po: <b>{curr_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
-                                f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY}</b>\n"
-                                f"──────────────────────────────\n"
-                                f"🔓 <b>Slot ALFA natychmiast zwolniony. Gotówka uwolniona.</b>"
-                            )
-                        else:
-                            logger.error(f"❌ [MOMENTUM-SELL-FAIL] Błąd sprzedaży rynkowej dla {inst['label']}: {sell_res}")
+                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", sell_qty)
+                        await redis_trade.delete_key(pos_key)
+                        target_k = f"{redis_trade.prefix}{pos_key}"
+                        if target_k in active_keys:
+                            active_keys.remove(target_k)
+
+                        logger.info(f"🔓 [SLOT-FREED] Pomyślnie wyczyszczono zablokowany slot dla {inst['label']}.")
                         continue
 
                     if algo_state in ["filled", "canceled", "order_failed"]:
@@ -1566,39 +1556,30 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                         logger.warning(f"⏳ [TIME-STOP EXPIRED] Pozycja Breakout {inst['label']} przekroczyła {round(max_timeout/3600, 1)}h. Wymuszone wyjście...")
                         cancel_ok = await okx_client.cancel_algo_order(inst["symbol"], algo_id)
                         if not cancel_ok:
-                            logger.error(f"⚠️ [BREAKOUT-TIME-STOP] Brak potwierdzenia odwołania OCO {algo_id} dla {inst['label']}. Ponawiam w kolejnym cyklu.")
-                            continue
+                            logger.warning(f"⚠️ [TIME-STOP FORCE CLEANUP] Zlecenie OCO {algo_id} nie istnieje na giełdzie. Wymuszam czyszczenie sieroty w Redis dla {inst['label']}.")
 
                         base_ccy = inst["symbol"].split("-")[0]
                         qty_to_sell = float(pos_data.get("qty", 0.0))
-                        avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=3)
-                        sell_qty = floor_to_precision(min(qty_to_sell, avail_bal) if avail_bal > 0 else qty_to_sell, inst["round_digits"])
-                        sell_qty = max(inst["min_qty"], sell_qty)
-
-                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", sell_qty)
-                        if sell_res and sell_res.get("code") == "0":
+                        avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=2)
+                        
+                        if avail_bal < inst["min_qty"]:
+                            logger.info(f"🧹 [SLOT CLEANUP] Brak tokenów {base_ccy} na giełdzie. Czyszczę martwy wpis w Redis dla {inst['label']}.")
                             await redis_trade.delete_key(pos_key)
                             target_key = f"{redis_trade.prefix}{pos_key}"
                             if target_key in active_keys:
                                 active_keys.remove(target_key)
+                            continue
 
-                            t_now = await okx_client.get_market_ticker(inst["symbol"])
-                            curr_p = t_now.get("last", 0.0) if t_now else float(pos_data.get("buy_price", 0.0))
-                            buy_p = float(pos_data.get("buy_price", curr_p))
-                            pnl_net = round(((curr_p - buy_p) * sell_qty) - (curr_p * sell_qty * 0.0016), 2)
+                        sell_qty = floor_to_precision(min(qty_to_sell, avail_bal), inst["round_digits"])
+                        sell_qty = max(inst["min_qty"], sell_qty)
 
-                            await tg_dispatcher.push(
-                                f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
-                                f"──────────────────────────────\n"
-                                f"📈 Strategia: <b>BREAKOUT</b>\n"
-                                f"⏱️ Czas trwania: <b>{round(elapsed_time / 3600.0, 1)}h / {round(max_timeout / 3600.0, 1)}h</b>\n"
-                                f"💰 Zamknięto po: <b>{curr_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
-                                f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY}</b>\n"
-                                f"──────────────────────────────\n"
-                                f"🔓 <b>Slot ALFA natychmiast zwolniony. Gotówka uwolniona.</b>"
-                            )
-                        else:
-                            logger.error(f"❌ [BREAKOUT-SELL-FAIL] Błąd sprzedaży rynkowej dla {inst['label']}: {sell_res}")
+                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", sell_qty)
+                        await redis_trade.delete_key(pos_key)
+                        target_key = f"{redis_trade.prefix}{pos_key}"
+                        if target_key in active_keys:
+                            active_keys.remove(target_key)
+
+                        logger.info(f"🔓 [SLOT-FREED] Pomyślnie wyczyszczono zablokowany slot dla {inst['label']}.")
                         continue
 
                     if algo_state in ["filled", "canceled", "order_failed"]:
@@ -2042,7 +2023,7 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER, GLOBAL_WS_FEED
-    logger.info("⚡ [TRADING MULTI-TASKING ONLINE] Uruchamianie workerów v11.1 (WS + Momentum + Breakout + Grid)...")
+    logger.info("⚡ [TRADING MULTI-TASKING ONLINE] Uruchamianie workerów v11.2 (WS + Momentum + Breakout + Grid)...")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
     if RATE_LIMITER is None:
         RATE_LIMITER = TokenBucketRateLimiter()
@@ -2108,7 +2089,7 @@ def manual_analysis_trigger():
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
         return jsonify({"status": "error", "message": "Potok tradingu nie jest gotowy."}), 500
     asyncio.run_coroutine_threadsafe(run_async_pipeline(), BACKGROUND_LOOP)
-    return jsonify({"status": "success", "message": f"Analiza rynków OKX ({QUOTE_CCY}) v11.1 uruchomiona pomyślnie."}), 200
+    return jsonify({"status": "success", "message": f"Analiza rynków OKX ({QUOTE_CCY}) v11.2 uruchomiona pomyślnie."}), 200
 
 @app.route('/emergency-liquidate', methods=['GET', 'POST'])
 def emergency_liquidate_to_cash():
