@@ -18,19 +18,19 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 # =========================================================================
-# SYSTEMOWY MODUŁ OBSERVABILITY & GLOBAL CONTEXT (WERSJA v11.0)
+# SYSTEMOWY MODUŁ OBSERVABILITY & GLOBAL CONTEXT (WERSJA v11.1)
 # =========================================================================
 LOG_LEVEL_CONFIG = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO),
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Algorithmic_Trading_Engine_v11.0_OKX_PRODUCTION")
+logger = logging.getLogger("Algorithmic_Trading_Engine_v11.1_OKX_PRODUCTION")
 
 # Globalny przełącznik środowiska: True = Sandbox (Demo), False = Live (Prawdziwe Subkonto)
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
 
-logger.info(f"⚙️ [SYSTEM-INIT] Uruchamianie silnika v11.0 [3 SLOTY ALFA | DUAL TIME-STOP | LIVE: {not IS_SANDBOX}]")
+logger.info(f"⚙️ [SYSTEM-INIT] Uruchamianie silnika v11.1 [3 SLOTY ALFA | DUAL TIME-STOP | LIVE: {not IS_SANDBOX}]")
 
 BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
 PIPELINE_LOCK: Optional[asyncio.Lock] = None
@@ -43,8 +43,8 @@ QUOTE_CCY = "USDC"
 
 # PARAMETRY CZASOWE STRAŻNIKA CZASU (DUAL TIME-STOP W SEKUNDACH)
 ALPHA_TIMEOUT_MAP = {
-    "MOMENTUM": 8 * 3600,       # 8 godzin = 28800 sekund
-    "BREAKOUT": 8 * 3600,       # 8 godzin = 28800 sekund
+    "MOMENTUM": 8 * 3600,        # 8 godzin = 28800 sekund
+    "BREAKOUT": 8 * 3600,        # 8 godzin = 28800 sekund
     "MEAN_REVERSION": 18 * 3600  # 18 godzin = 64800 sekund
 }
 
@@ -884,7 +884,7 @@ class OKXSpotClient:
             return False
 
     async def cancel_algo_order(self, symbol: str, algo_id: str) -> bool:
-        """[NOWOŚĆ v11.0] Anulowanie algorytmicznego zlecenia OCO przed interwencją Strażnika Czasu."""
+        """[POPRAWKA v11.1] Anulowanie zlecenia OCO z rygorystyczną asercją odpowiedzi OKX."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return False
         await self.rate_limiter.consume()
@@ -898,7 +898,12 @@ class OKXSpotClient:
         try:
             async with self.session.post(url, data=body_json, headers=headers, timeout=5) as r:
                 data = await r.json()
-                return data.get("code") == "0"
+                if data.get("code") == "0" and data.get("data"):
+                    item = data["data"][0]
+                    s_code = str(item.get("sCode", ""))
+                    # "0" = anulowano z sukcesem, "51401"/"51400" = zlecenie nie istnieje lub zostało już zamknięte
+                    return s_code in ("0", "51401", "51400")
+                return False
         except Exception as e:
             logger.error(f"❌ [OKX-CANCEL-ALGO-ERROR] Błąd anulowania zlecenia OCO {algo_id}: {e}")
             return False
@@ -966,7 +971,7 @@ async def run_async_pipeline():
             total_balance = wallet.get("total_equity", 0.0)
             available_cash = wallet.get("available_cash", 0.0)
 
-            # [AKTUALIZACJA v11.0] SPRAWDZENIE ZAJĘTOŚCI KOSZYKA ALFA (MAX 3 POZYCJE)
+            # [AKTUALIZACJA v11.1] SPRAWDZENIE ZAJĘTOŚCI KOSZYKA ALFA (MAX 3 POZYCJE)
             alpha_active_count = 0
             active_keys = []
             try:
@@ -1003,33 +1008,42 @@ async def run_async_pipeline():
 
                     if algo_state not in ["filled", "canceled", "order_failed"] and elapsed_time > max_timeout:
                         logger.warning(f"⏳ [TIME-STOP EXPIRED] Pozycja {inst['label']} przekroczyła {round(max_timeout/3600, 1)}h (trwa {round(elapsed_time/3600, 1)}h). Likwidacja awaryjna do gotówki...")
-                        await okx_client.cancel_algo_order(inst["symbol"], algo_id)
-                        await asyncio.sleep(0.4)
-                        
+                        cancel_ok = await okx_client.cancel_algo_order(inst["symbol"], algo_id)
+                        if not cancel_ok:
+                            logger.error(f"⚠️ [MEAN-REV-TIME-STOP] Brak potwierdzenia odwołania OCO {algo_id} dla {inst['label']}. Ponawiam w kolejnym cyklu.")
+                            continue
+
+                        base_ccy = inst["symbol"].split("-")[0]
                         qty_to_sell = float(pos_data.get("qty", 0.0))
-                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", qty_to_sell)
-                        await redis_trade.delete_key(pos_key)
-                        
-                        target_k = f"{redis_trade.prefix}{pos_key}"
-                        if target_k in active_keys:
-                            active_keys.remove(target_k)
-                        alpha_active_count = max(0, alpha_active_count - 1)
+                        avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=3)
+                        sell_qty = floor_to_precision(min(qty_to_sell, avail_bal) if avail_bal > 0 else qty_to_sell, inst["round_digits"])
+                        sell_qty = max(inst["min_qty"], sell_qty)
 
-                        t_now = await okx_client.get_market_ticker(inst["symbol"])
-                        curr_p = t_now.get("last", 0.0) if t_now else float(pos_data.get("buy_price", 0.0))
-                        buy_p = float(pos_data.get("buy_price", curr_p))
-                        pnl_net = round(((curr_p - buy_p) * qty_to_sell) - (curr_p * qty_to_sell * 0.0016), 2)
+                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", sell_qty)
+                        if sell_res and sell_res.get("code") == "0":
+                            await redis_trade.delete_key(pos_key)
+                            target_k = f"{redis_trade.prefix}{pos_key}"
+                            if target_k in active_keys:
+                                active_keys.remove(target_k)
+                            alpha_active_count = max(0, alpha_active_count - 1)
 
-                        await tg.push(
-                            f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
-                            f"──────────────────────────────\n"
-                            f"📈 Strategia: <b>MEAN REVERSION</b>\n"
-                            f"⏱️ Czas trwania: <b>{round(elapsed_time / 3600.0, 1)}h / {round(max_timeout / 3600.0, 1)}h</b>\n"
-                            f"💰 Zamknięto po: <b>{curr_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
-                            f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY}</b>\n"
-                            f"──────────────────────────────\n"
-                            f"🔓 <b>Slot ALFA natychmiast zwolniony. Gotówka uwolniona.</b>"
-                        )
+                            t_now = await okx_client.get_market_ticker(inst["symbol"])
+                            curr_p = t_now.get("last", 0.0) if t_now else float(pos_data.get("buy_price", 0.0))
+                            buy_p = float(pos_data.get("buy_price", curr_p))
+                            pnl_net = round(((curr_p - buy_p) * sell_qty) - (curr_p * sell_qty * 0.0016), 2)
+
+                            await tg.push(
+                                f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
+                                f"──────────────────────────────\n"
+                                f"📈 Strategia: <b>MEAN REVERSION</b>\n"
+                                f"⏱️ Czas trwania: <b>{round(elapsed_time / 3600.0, 1)}h / {round(max_timeout / 3600.0, 1)}h</b>\n"
+                                f"💰 Zamknięto po: <b>{curr_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
+                                f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY}</b>\n"
+                                f"──────────────────────────────\n"
+                                f"🔓 <b>Slot ALFA natychmiast zwolniony. Gotówka uwolniona.</b>"
+                            )
+                        else:
+                            logger.error(f"❌ [MEAN-REV-SELL-FAIL] Błąd sprzedaży rynkowej dla {inst['label']}: {sell_res}")
                         continue
 
                     if algo_state in ["filled", "canceled", "order_failed"]:
@@ -1130,7 +1144,7 @@ async def run_async_pipeline():
                         logger.info(f"⚠️ [{inst['label']}] Blokada: BandWidth skrajnie niski ({bandwidth}). Rynek w kompresji.")
                         continue
 
-                    # [AKTUALIZACJA v11.0] TWARDY LIMIT 3 SLOTÓW ALFA
+                    # [AKTUALIZACJA v11.1] TWARDY LIMIT 3 SLOTÓW ALFA
                     if alpha_active_count >= 3:
                         logger.info(f"🛡️ [ALPHA LIMIT] Pozycje ALFA: {alpha_active_count}/3. Blokada nowych zakupów dla {inst['label']}.")
                         continue
@@ -1145,7 +1159,7 @@ async def run_async_pipeline():
                     sl_pct = max(0.01, sl_pct)
                     
                     safe_cash = max(0.0, available_cash - 2.0)
-                    # [AKTUALIZACJA v11.0] ALOKACJA KAPITAŁOWA ZREDUKOWANA DO 18% (OK. 62-64 USDC)
+                    # [AKTUALIZACJA v11.1] ALOKACJA KAPITAŁOWA ZREDUKOWANA DO 18% (OK. 62-64 USDC)
                     position_value = min(risk_capital / sl_pct, total_balance * 0.18, safe_cash * 0.95)
                     calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
                     calculated_qty = max(inst["min_qty"], calculated_qty)
@@ -1203,7 +1217,7 @@ async def run_async_pipeline():
                                         "buy_price": current_price, 
                                         "tp_price": price_tp, 
                                         "sl_price": price_sl, 
-                                        "time": now_ts,
+                                        "time": now_ts, 
                                         "type": "MEAN_REVERSION"
                                     }
                                 )
@@ -1252,19 +1266,17 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
             url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
             async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
                 active_keys = (await resp_k.json()).get("result", []) if resp_k.status == 200 else []
-                active_count = len(active_keys)
-            
-            # [AKTUALIZACJA v11.0] LIMIT ZWIĘKSZONY DO 3
-            if active_count >= 3:
-                logger.info("🛡️ [MOMENTUM] Limit 3 pozycji ALFA osiągnięty. Worker wstrzymuje skanowanie.")
-                await asyncio.sleep(60)
-                continue
 
-            # RECONCILER + DEDYKOWANY STRAŻNIK CZASU MOMENTUM (8 GODZIN)
+            # =========================================================================
+            # KROK 1: RECONCILER + STRAŻNIK CZASU ZAWSZE JAKO PIERWSZY (ELIMINACJA DEADLOCKA)
+            # =========================================================================
             for inst in instruments:
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                 pos_data = await redis_trade.get_position_state(pos_key)
-                if pos_data and pos_data.get("status") == "WAITING_OCO" and "algo_id" in pos_data:
+                if not pos_data:
+                    continue
+
+                if pos_data.get("status") == "WAITING_OCO" and "algo_id" in pos_data:
                     algo_id = pos_data["algo_id"]
                     algo_state, actual_px = await okx_client.get_algo_order_state(algo_id)
                     
@@ -1275,32 +1287,41 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
 
                     if algo_state not in ["filled", "canceled", "order_failed"] and elapsed_time > max_timeout:
                         logger.warning(f"⏳ [TIME-STOP EXPIRED] Pozycja Momentum {inst['label']} przekroczyła {round(max_timeout/3600, 1)}h. Wymuszone wyjście...")
-                        await okx_client.cancel_algo_order(inst["symbol"], algo_id)
-                        await asyncio.sleep(0.4)
-                        
+                        cancel_ok = await okx_client.cancel_algo_order(inst["symbol"], algo_id)
+                        if not cancel_ok:
+                            logger.error(f"⚠️ [MOMENTUM-TIME-STOP] Brak potwierdzenia odwołania OCO {algo_id} dla {inst['label']}. Ponawiam w kolejnym cyklu.")
+                            continue
+
+                        base_ccy = inst["symbol"].split("-")[0]
                         qty_to_sell = float(pos_data.get("qty", 0.0))
-                        await inst["client"].execute_market_order(inst["symbol"], "sell", qty_to_sell)
-                        await redis_trade.delete_key(pos_key)
-                        
-                        target_k = f"{redis_trade.prefix}{pos_key}"
-                        if target_k in active_keys:
-                            active_keys.remove(target_k)
+                        avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=3)
+                        sell_qty = floor_to_precision(min(qty_to_sell, avail_bal) if avail_bal > 0 else qty_to_sell, inst["round_digits"])
+                        sell_qty = max(inst["min_qty"], sell_qty)
 
-                        t_now = await okx_client.get_market_ticker(inst["symbol"])
-                        curr_p = t_now.get("last", 0.0) if t_now else float(pos_data.get("buy_price", 0.0))
-                        buy_p = float(pos_data.get("buy_price", curr_p))
-                        pnl_net = round(((curr_p - buy_p) * qty_to_sell) - (curr_p * qty_to_sell * 0.0016), 2)
+                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", sell_qty)
+                        if sell_res and sell_res.get("code") == "0":
+                            await redis_trade.delete_key(pos_key)
+                            target_k = f"{redis_trade.prefix}{pos_key}"
+                            if target_k in active_keys:
+                                active_keys.remove(target_k)
 
-                        await tg_dispatcher.push(
-                            f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
-                            f"──────────────────────────────\n"
-                            f"📈 Strategia: <b>MOMENTUM</b>\n"
-                            f"⏱️ Czas trwania: <b>{round(elapsed_time / 3600.0, 1)}h / {round(max_timeout / 3600.0, 1)}h</b>\n"
-                            f"💰 Zamknięto po: <b>{curr_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
-                            f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY}</b>\n"
-                            f"──────────────────────────────\n"
-                            f"🔓 <b>Slot ALFA natychmiast zwolniony. Gotówka uwolniona.</b>"
-                        )
+                            t_now = await okx_client.get_market_ticker(inst["symbol"])
+                            curr_p = t_now.get("last", 0.0) if t_now else float(pos_data.get("buy_price", 0.0))
+                            buy_p = float(pos_data.get("buy_price", curr_p))
+                            pnl_net = round(((curr_p - buy_p) * sell_qty) - (curr_p * sell_qty * 0.0016), 2)
+
+                            await tg_dispatcher.push(
+                                f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
+                                f"──────────────────────────────\n"
+                                f"📈 Strategia: <b>MOMENTUM</b>\n"
+                                f"⏱️ Czas trwania: <b>{round(elapsed_time / 3600.0, 1)}h / {round(max_timeout / 3600.0, 1)}h</b>\n"
+                                f"💰 Zamknięto po: <b>{curr_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
+                                f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY}</b>\n"
+                                f"──────────────────────────────\n"
+                                f"🔓 <b>Slot ALFA natychmiast zwolniony. Gotówka uwolniona.</b>"
+                            )
+                        else:
+                            logger.error(f"❌ [MOMENTUM-SELL-FAIL] Błąd sprzedaży rynkowej dla {inst['label']}: {sell_res}")
                         continue
 
                     if algo_state in ["filled", "canceled", "order_failed"]:
@@ -1353,7 +1374,18 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                                     f"Slot zwolniony. Kapitał zabezpieczony."
                                 )
 
-            # BLOKADA POWTÓRNYCH ZAKUPÓW
+            # =========================================================================
+            # KROK 2: WERYFIKACJA LIMITU POZYCJI DOPIERO PRZED SKANOWANIEM NOWYCH ZAKUPÓW
+            # =========================================================================
+            active_count = len(active_keys)
+            if active_count >= 3:
+                logger.info(f"🛡️ [MOMENTUM] Limit {active_count}/3 pozycji ALFA osiągnięty. Worker wstrzymuje nowe zakupy.")
+                await asyncio.sleep(60)
+                continue
+
+            # =========================================================================
+            # KROK 3: BLOKADA POWTÓRNYCH ZAKUPÓW I SKANOWANIE NOWYCH SYGNAŁÓW
+            # =========================================================================
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
@@ -1395,7 +1427,6 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                         risk_capital = total_balance * 0.01
                         sl_pct = 0.02
                         safe_cash = max(0.0, available_cash - 2.0)
-                        # [AKTUALIZACJA v11.0] ALOKACJA KAPITAŁOWA ZREDUKOWANA DO 18% (OK. 62-64 USDC)
                         position_value = min(risk_capital / sl_pct, total_balance * 0.18, safe_cash * 0.95)
                         
                         calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
@@ -1455,7 +1486,7 @@ async def independent_momentum_worker(session, redis_trade, tg_dispatcher, okx_c
                                         "buy_price": current_price, 
                                         "tp_price": price_tp, 
                                         "sl_price": price_sl, 
-                                        "time": now_ts,
+                                        "time": now_ts, 
                                         "type": "MOMENTUM"
                                     }
                                 )
@@ -1506,15 +1537,10 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
             url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
             async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as resp_k:
                 active_keys = (await resp_k.json()).get("result", []) if resp_k.status == 200 else []
-                active_count = len(active_keys)
-            
-            # [AKTUALIZACJA v11.0] LIMIT ZWIĘKSZONY DO 3
-            if active_count >= 3:
-                logger.info(f"🛡️ [BREAKOUT] Limit {active_count}/3 pozycji ALFA osiągnięty. Worker wstrzymuje skanowanie.")
-                await asyncio.sleep(60)
-                continue
 
-            # RECONCILER + DEDYKOWANY STRAŻNIK CZASU BREAKOUT (8 GODZIN)
+            # =========================================================================
+            # KROK 1: RECONCILER + STRAŻNIK CZASU ZAWSZE JAKO PIERWSZY (ELIMINACJA DEADLOCKA)
+            # =========================================================================
             for inst in instruments:
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                 pos_data = await redis_trade.get_position_state(pos_key)
@@ -1532,38 +1558,46 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
 
                     if algo_state not in ["filled", "canceled", "order_failed"] and elapsed_time > max_timeout:
                         logger.warning(f"⏳ [TIME-STOP EXPIRED] Pozycja Breakout {inst['label']} przekroczyła {round(max_timeout/3600, 1)}h. Wymuszone wyjście...")
-                        await okx_client.cancel_algo_order(inst["symbol"], algo_id)
-                        await asyncio.sleep(0.4)
-                        
+                        cancel_ok = await okx_client.cancel_algo_order(inst["symbol"], algo_id)
+                        if not cancel_ok:
+                            logger.error(f"⚠️ [BREAKOUT-TIME-STOP] Brak potwierdzenia odwołania OCO {algo_id} dla {inst['label']}. Ponawiam w kolejnym cyklu.")
+                            continue
+
+                        base_ccy = inst["symbol"].split("-")[0]
                         qty_to_sell = float(pos_data.get("qty", 0.0))
-                        await inst["client"].execute_market_order(inst["symbol"], "sell", qty_to_sell)
-                        await redis_trade.delete_key(pos_key)
-                        
-                        target_key = f"{redis_trade.prefix}{pos_key}"
-                        if target_key in active_keys:
-                            active_keys.remove(target_key)
+                        avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=3)
+                        sell_qty = floor_to_precision(min(qty_to_sell, avail_bal) if avail_bal > 0 else qty_to_sell, inst["round_digits"])
+                        sell_qty = max(inst["min_qty"], sell_qty)
 
-                        t_now = await okx_client.get_market_ticker(inst["symbol"])
-                        curr_p = t_now.get("last", 0.0) if t_now else float(pos_data.get("buy_price", 0.0))
-                        buy_p = float(pos_data.get("buy_price", curr_p))
-                        pnl_net = round(((curr_p - buy_p) * qty_to_sell) - (curr_p * qty_to_sell * 0.0016), 2)
+                        sell_res = await inst["client"].execute_market_order(inst["symbol"], "sell", sell_qty)
+                        if sell_res and sell_res.get("code") == "0":
+                            await redis_trade.delete_key(pos_key)
+                            target_key = f"{redis_trade.prefix}{pos_key}"
+                            if target_key in active_keys:
+                                active_keys.remove(target_key)
 
-                        await tg_dispatcher.push(
-                            f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
-                            f"──────────────────────────────\n"
-                            f"📈 Strategia: <b>BREAKOUT</b>\n"
-                            f"⏱️ Czas trwania: <b>{round(elapsed_time / 3600.0, 1)}h / {round(max_timeout / 3600.0, 1)}h</b>\n"
-                            f"💰 Zamknięto po: <b>{curr_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
-                            f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY}</b>\n"
-                            f"──────────────────────────────\n"
-                            f"🔓 <b>Slot ALFA natychmiast zwolniony. Gotówka uwolniona.</b>"
-                        )
+                            t_now = await okx_client.get_market_ticker(inst["symbol"])
+                            curr_p = t_now.get("last", 0.0) if t_now else float(pos_data.get("buy_price", 0.0))
+                            buy_p = float(pos_data.get("buy_price", curr_p))
+                            pnl_net = round(((curr_p - buy_p) * sell_qty) - (curr_p * sell_qty * 0.0016), 2)
+
+                            await tg_dispatcher.push(
+                                f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • WYGASZENIE TTL</b>\n"
+                                f"──────────────────────────────\n"
+                                f"📈 Strategia: <b>BREAKOUT</b>\n"
+                                f"⏱️ Czas trwania: <b>{round(elapsed_time / 3600.0, 1)}h / {round(max_timeout / 3600.0, 1)}h</b>\n"
+                                f"💰 Zamknięto po: <b>{curr_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
+                                f"💵 Wynik netto: <b>{pnl_net} {QUOTE_CCY}</b>\n"
+                                f"──────────────────────────────\n"
+                                f"🔓 <b>Slot ALFA natychmiast zwolniony. Gotówka uwolniona.</b>"
+                            )
+                        else:
+                            logger.error(f"❌ [BREAKOUT-SELL-FAIL] Błąd sprzedaży rynkowej dla {inst['label']}: {sell_res}")
                         continue
 
                     if algo_state in ["filled", "canceled", "order_failed"]:
                         logger.info(f"🧹 [BREAKOUT-RECONCILE] Zlecenie OCO dla {inst['label']} zmieniło stan na '{algo_state}'.")
                         await redis_trade.delete_key(pos_key)
-                        
                         target_key = f"{redis_trade.prefix}{pos_key}"
                         if target_key in active_keys:
                             active_keys.remove(target_key)
@@ -1580,7 +1614,7 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                                 t_now = await okx_client.get_market_ticker(inst["symbol"])
                                 curr_p = t_now.get("last", 0.0) if t_now else 0.0
                                 exit_p = sl_p if curr_p > 0 and abs(curr_p - sl_p) < abs(curr_p - tp_p) else tp_p
-                            
+
                             pnl_gross = (exit_p - buy_p) * qty_p
                             fees = (buy_p * qty_p * 0.001) + (exit_p * qty_p * 0.001)
                             pnl_net = round(pnl_gross - fees, 2)
@@ -1611,7 +1645,18 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                                     f"Slot zwolniony. Kapitał zabezpieczony."
                                 )
 
-            # BLOKADA POWTÓRNYCH ZAKUPÓW
+            # =========================================================================
+            # KROK 2: WERYFIKACJA LIMITU POZYCJI DOPIERO PRZED SKANOWANIEM NOWYCH ZAKUPÓW
+            # =========================================================================
+            active_count = len(active_keys)
+            if active_count >= 3:
+                logger.info(f"🛡️ [BREAKOUT] Limit {active_count}/3 pozycji ALFA osiągnięty. Worker wstrzymuje nowe zakupy.")
+                await asyncio.sleep(60)
+                continue
+
+            # =========================================================================
+            # KROK 3: BLOKADA POWTÓRNYCH ZAKUPÓW I SKANOWANIE WYBICIA
+            # =========================================================================
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
@@ -1630,7 +1675,6 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                     continue
 
                 brk_metrics = BreakoutQuantCore.calculate_breakout(candles_raw, period=20)
-                
                 if brk_metrics:
                     current_price = float(candles_raw[-1][4])
                     logger.info(f"💥 [BREAKOUT-SCAN] {inst['label']} | Bw: {brk_metrics['bandwidth']} (Komp < 0.015) | P: {current_price} vs Banda: {brk_metrics['upper_band']}")
@@ -1649,7 +1693,6 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                         risk_capital = total_balance * 0.01
                         sl_pct = 0.02
                         safe_cash = max(0.0, available_cash - 2.0)
-                        # [AKTUALIZACJA v11.0] ALOKACJA KAPITAŁOWA ZREDUKOWANA DO 18% (OK. 62-64 USDC)
                         position_value = min(risk_capital / sl_pct, total_balance * 0.18, safe_cash * 0.95)
                         
                         calculated_qty = floor_to_precision(position_value / current_price, inst["round_digits"])
@@ -1710,7 +1753,7 @@ async def independent_breakout_worker(session, redis_trade, tg_dispatcher, okx_c
                                         "buy_price": current_price, 
                                         "tp_price": price_tp, 
                                         "sl_price": price_sl, 
-                                        "time": now_ts,
+                                        "time": now_ts, 
                                         "type": "BREAKOUT"
                                     }
                                 )
@@ -1993,7 +2036,7 @@ async def independent_grid_worker(session, redis_trade, tg_dispatcher, okx_clien
 # =========================================================================
 async def continuous_async_cron(loop):
     global ASYNC_SHUTDOWN_EVENT, RATE_LIMITER, GLOBAL_WS_FEED
-    logger.info("⚡ [TRADING MULTI-TASKING ONLINE] Uruchamianie workerów v11.0 (WS + Momentum + Breakout + Grid)...")
+    logger.info("⚡ [TRADING MULTI-TASKING ONLINE] Uruchamianie workerów v11.1 (WS + Momentum + Breakout + Grid)...")
     ASYNC_SHUTDOWN_EVENT = asyncio.Event()
     if RATE_LIMITER is None:
         RATE_LIMITER = TokenBucketRateLimiter()
@@ -2059,7 +2102,7 @@ def manual_analysis_trigger():
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
         return jsonify({"status": "error", "message": "Potok tradingu nie jest gotowy."}), 500
     asyncio.run_coroutine_threadsafe(run_async_pipeline(), BACKGROUND_LOOP)
-    return jsonify({"status": "success", "message": f"Analiza rynków OKX ({QUOTE_CCY}) v11.0 uruchomiona pomyślnie."}), 200
+    return jsonify({"status": "success", "message": f"Analiza rynków OKX ({QUOTE_CCY}) v11.1 uruchomiona pomyślnie."}), 200
 
 @app.route('/emergency-liquidate', methods=['GET', 'POST'])
 def emergency_liquidate_to_cash():
