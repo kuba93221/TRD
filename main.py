@@ -884,7 +884,7 @@ class OKXSpotClient:
             return False
 
     async def cancel_algo_order(self, symbol: str, algo_id: str) -> bool:
-        """[POPRAWKA v11.1] Anulowanie zlecenia OCO z rygorystyczną asercją odpowiedzi OKX."""
+        """[POPRAWKA v11.2] Obsługa pełnego spektrum kodów rozliczenia OCO na OKX."""
         if not self.api_key or not self.secret_key or not self.passphrase:
             return False
         await self.rate_limiter.consume()
@@ -901,8 +901,14 @@ class OKXSpotClient:
                 if data.get("code") == "0" and data.get("data"):
                     item = data["data"][0]
                     s_code = str(item.get("sCode", ""))
-                    # "0" = anulowano z sukcesem, "51401"/"51400" = zlecenie nie istnieje lub zostało już zamknięte
-                    return s_code in ("0", "51401", "51400")
+                    # "0" = anulowano pomyślnie
+                    # "51410" = zlecenie nie istnieje, zostało już anulowane lub zrealizowane na giełdzie
+                    # "51400" / "51401" = zlecenie w trakcie anulowania lub anulowane
+                    # "51415" = zlecenie zostało już wyzwolone (np. uderzyło w SL/TP)
+                    if s_code in ("0", "51410", "51400", "51401", "51415", "51402"):
+                        return True
+                    logger.warning(f"⚠️ [OKX-ALGO-CANCEL] OKX zwrócił sCode {s_code}: {item.get('sMsg')}")
+                    return False
                 return False
         except Exception as e:
             logger.error(f"❌ [OKX-CANCEL-ALGO-ERROR] Błąd anulowania zlecenia OCO {algo_id}: {e}")
