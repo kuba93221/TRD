@@ -1075,6 +1075,14 @@ async def reconcile_and_timestop(
 
             await redis_trade.delete_key(pos_key)
             logger.info(f"🔓 [SLOT-FREED] Zwolniono przeterminowany slot dla {inst['label']}.")
+            await tg.push(
+                f"⏳ <b>[STRAŻNIK CZASU: {inst['label']}] • TIME-STOP EXPIRED</b>\n"
+                f"──────────────────────────────\n"
+                f"📈 Strategia: <b>{strategy_type}</b>\n"
+                f"⌛ Czas trwania: <b>{round(elapsed_time/3600, 1)}h</b> (Limit: {round(max_timeout/3600, 1)}h)\n"
+                f"💰 Pozycja zamknięta po cenie rynkowej do {QUOTE_CCY}.\n"
+                f"Slot zwolniony. Kapitał w gotówce."
+            )
             return True, pos_key
 
         # 2. Sprawdzenie realizacji na giełdzie (Filled / Canceled)
@@ -1109,6 +1117,7 @@ async def reconcile_and_timestop(
                         f"📦 Wielkość: <b>{qty_p}</b>\n"
                         f"──────────────────────────────\n"
                         f"💵 <b>Zysk netto: +{pnl_net} {QUOTE_CCY} (+{roe_net}%)</b>\n"
+                        f"🛡️ Prowizja giełdowa: uwzględniona\n"
                         f"Slot zwolniony. Kapitał w gotówce."
                     )
                 else:
@@ -1120,6 +1129,7 @@ async def reconcile_and_timestop(
                         f"📦 Wielkość: <b>{qty_p}</b>\n"
                         f"──────────────────────────────\n"
                         f"📉 <b>Strata netto: {pnl_net} {QUOTE_CCY} ({roe_net}%)</b>\n"
+                        f"🛡️ Prowizja giełdowa: uwzględniona\n"
                         f"Slot zwolniony. Kapitał zabezpieczony."
                     )
             return True, pos_key
@@ -1277,6 +1287,12 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                                 logger.critical(f"🚨 [FAIL-SAFE] OCO odrzucone dla {inst['label']}! Natychmiastowa likwidacja do USDC...")
                                 await inst["client"].execute_market_order(inst["symbol"], "sell", calc_qty)
                                 await redis_trade.delete_key(pos_key)
+                                await tg.push(
+                                    f"🚨 <b>[FAIL-SAFE KILL: POZYCJA ZLIKWIDOWANA]</b>\n"
+                                    f"──────────────────────────────\n"
+                                    f"Pozycja <b>{inst['label']}</b> (MEAN REVERSION) została natychmiast zamknięta zleceniem Market z powodu błędu zlecenia obronnego OCO.\n"
+                                    f"Błąd OKX: Zlecenie OCO odrzucone lub brak odpowiedzi."
+                                )
 
         except Exception as e:
             logger.error(f"❌ [MEAN-REV-ERROR] Awaria w workerze: {e}")
@@ -1407,6 +1423,12 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                                 logger.critical(f"🚨 [FAIL-SAFE] OCO odrzucone dla {inst['label']}! Likwidacja...")
                                 await inst["client"].execute_market_order(inst["symbol"], "sell", calc_qty)
                                 await redis_trade.delete_key(pos_key)
+                                await tg.push(
+                                    f"🚨 <b>[FAIL-SAFE KILL: POZYCJA ZLIKWIDOWANA]</b>\n"
+                                    f"──────────────────────────────\n"
+                                    f"Pozycja <b>{inst['label']}</b> (MOMENTUM) została natychmiast zamknięta zleceniem Market z powodu błędu zlecenia obronnego OCO.\n"
+                                    f"Błąd OKX: Zlecenie OCO odrzucone lub brak odpowiedzi."
+                                )
 
         except Exception as e:
             logger.error(f"❌ [MOMENTUM-ERROR] Błąd w workerze: {e}")
@@ -1533,6 +1555,12 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                 logger.critical(f"🚨 [FAIL-SAFE] OCO odrzucone dla {inst['label']}! Likwidacja do USDC...")
                                 await inst["client"].execute_market_order(inst["symbol"], "sell", calc_qty)
                                 await redis_trade.delete_key(pos_key)
+                                await tg.push(
+                                    f"🚨 <b>[FAIL-SAFE KILL: POZYCJA ZLIKWIDOWANA]</b>\n"
+                                    f"──────────────────────────────\n"
+                                    f"Pozycja <b>{inst['label']}</b> (BREAKOUT) została natychmiast zamknięta zleceniem Market z powodu błędu zlecenia obronnego OCO.\n"
+                                    f"Błąd OKX: Zlecenie OCO odrzucone lub brak odpowiedzi."
+                                )
 
         except Exception as e:
             logger.error(f"❌ [BREAKOUT-ERROR] Błąd w workerze: {e}")
@@ -1634,8 +1662,14 @@ async def independent_grid_worker(session, redis_trade, tg, okx_client):
                         roe_net = round((pnl_net / (buy_p * qty_p)) * 100.0, 2) if buy_p > 0 else 0.0
 
                         await tg.push(
-                            f"🧱 <b>[GRID PROFIT: {inst['label']}]</b>\n"
-                            f"Sprzedano: <b>{exit_p} {QUOTE_CCY}</b> | Zysk netto: <b>+{pnl_net} {QUOTE_CCY} (+{roe_net}%)</b>"
+                            f"🧱 <b>[GRID PROFIT: {inst['label']}] • POZIOM L1</b>\n"
+                            f"──────────────────────────────\n"
+                            f"💰 Sprzedano po: <b>{exit_p} {QUOTE_CCY}</b> (Kupiono: {buy_p} {QUOTE_CCY})\n"
+                            f"📦 Wolumen: <b>{qty_p}</b>\n"
+                            f"──────────────────────────────\n"
+                            f"💵 <b>Zysk siatki netto: +{pnl_net} {QUOTE_CCY} (+{roe_net}%)</b>\n"
+                            f"🛡️ Prowizja giełdowa: uwzględniona\n"
+                            f"Siatka resetuje poziom i poluje dalej."
                         )
                         continue
 
@@ -1652,6 +1686,22 @@ async def independent_grid_worker(session, redis_trade, tg, okx_client):
                         await inst["client"].cancel_order(inst["symbol"], sell_ord_id)
                         await inst["client"].execute_market_order(inst["symbol"], "sell", float(active_pos["qty"]))
                         await redis_trade.delete_key(pos_key)
+
+                        buy_p = float(active_pos.get("buy_price", 0.0))
+                        qty_p = float(active_pos.get("qty", 0.0))
+                        exit_p = current_market_price
+                        pnl_gross = (exit_p - buy_p) * qty_p
+                        fees = (buy_p * qty_p * 0.001) + (exit_p * qty_p * 0.001)
+                        pnl_net = round(pnl_gross - fees, 2)
+                        roe_net = round((pnl_net / (buy_p * qty_p)) * 100.0, 2) if buy_p > 0 else 0.0
+
+                        await tg.push(
+                            f"🛑 <b>[GRID STOP-LOSS TRIGGERED]</b>\n"
+                            f"──────────────────────────────\n"
+                            f"Instrument: <b>{inst['label']}</b>\n"
+                            f"💰 Wyjście awaryjne: <b>{exit_p} {QUOTE_CCY}</b> (Wejście: {buy_p} {QUOTE_CCY})\n"
+                            f"📉 <b>Strata netto: {pnl_net} {QUOTE_CCY} ({roe_net}%)</b>"
+                        )
                         continue
 
                 # Polowanie na nowy poziom GRID
@@ -1721,8 +1771,13 @@ async def independent_grid_worker(session, redis_trade, tg, okx_client):
                         })
                         grid_active_count += 1
                         await tg.push(
-                            f"🧱 <b>[GRID ENGINE: LIMIT ORDER]</b>\n"
-                            f"Instrument: <b>{inst['label']}</b> | Kupno Limit: <b>{price_buy} {QUOTE_CCY}</b>"
+                            f"🧱 <b>[GRID ENGINE: LIMIT ORDER PLACED]</b>\n"
+                            f"──────────────────────────────\n"
+                            f"📈 Instrument: <b>{inst['label']}</b>\n"
+                            f"📥 Kupno (Limit L1): <b>{price_buy} {QUOTE_CCY}</b>\n"
+                            f"📦 Wielkość: <b>{calc_qty}</b>\n"
+                            f"🎯 Planowany TP: <code>{price_tp} {QUOTE_CCY}</code> (+0.5%)\n"
+                            f"🛑 Stop Loss: <code>{price_sl} {QUOTE_CCY}</code> (-1.5%)"
                         )
         except Exception as e:
             logger.error(f"❌ [GRID-ERROR] Błąd w workerze: {e}")
