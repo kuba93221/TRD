@@ -20,7 +20,6 @@ from urllib.request import Request, urlopen
 # =========================================================================
 # SYSTEMOWY MODUŁ OBSERVABILITY & GLOBAL CONTEXT (v11.3 TELEMETRY READY)
 # =========================================================================
-# Wymuszenie natychmiastowego zrzutu logów w kontenerze Render (brak buforowania)
 try:
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(line_buffering=True)
@@ -43,7 +42,6 @@ _stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(
 logger.addHandler(_stream_handler)
 logger.propagate = False
 
-# Natychmiastowy meldunek startowy widoczny w 0.1s po deployu
 print("🚀 [BOOT] Silnik transakcyjny v11.3 inicjalizuje telemetrie na Renderze...", flush=True)
 
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
@@ -67,6 +65,9 @@ CONFIG = {
     "RESERVE_CASH_BUFFER_USDC": 2.0,
     "RISK_PER_TRADE_PCT": 0.01,
     "MAX_POSITION_PORTFOLIO_RATIO": 0.18,
+    "RISK_MANAGEMENT": {
+        "COOLDOWN_AFTER_SL_SEC": 14400  # 4 godziny kwarantanny po uderzeniu w Stop Loss
+    },
     "DYNAMIC_RISK": {
         "MIN_SL_PCT": 0.008,
         "MAX_SL_HARD_CAP": 0.020,
@@ -245,7 +246,7 @@ class TokenBucketRateLimiter:
                 self.tokens -= 1.0
 
 # =========================================================================
-# POMOST UPSTASH REDIS (BINARNY MSGPACK / HEX + EXPIRE TTL)
+# POMOST UPSTASH REDIS (BINARNY MSGPACK / HEX + EXPIRE TTL + COOLDOWN)
 # =========================================================================
 class UpstashRedisTradingBridge:
     def __init__(self, url: str, token: str, session: aiohttp.ClientSession):
@@ -385,6 +386,35 @@ class UpstashRedisTradingBridge:
                 await resp.read()
         except Exception:
             pass
+
+    # ==========================================
+    # MODUŁ KWARANTANNY (COOLDOWN)
+    # ==========================================
+    async def set_cooldown(self, symbol: str, seconds: int) -> bool:
+        """Ustawia kwarantannę dla symbolu na X sekund."""
+        if not self.url:
+            return False
+        safe_key = self._enforce_prefix(f"COOLDOWN:{symbol}")
+        try:
+            payload = [["SET", safe_key, "1", "EX", str(seconds)]]
+            async with self.session.post(f"{self.url}/pipeline", json=payload, headers=self.headers, timeout=3) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    async def is_in_cooldown(self, symbol: str) -> bool:
+        """Sprawdza, czy moneta jest obecnie w kwarantannie."""
+        if not self.url:
+            return False
+        safe_key = self._enforce_prefix(f"COOLDOWN:{symbol}")
+        try:
+            async with self.session.get(f"{self.url}/get/{safe_key}", headers=self.headers, timeout=3) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("result") is not None
+        except Exception:
+            pass
+        return False
 
 # =========================================================================
 # DYSPOZYTOR TELEGRAM
@@ -897,14 +927,12 @@ class OKXSpotClient:
                 if code == "0" and data.get("data"):
                     item = data["data"][0]
                     state = item.get("state")
-                    # Poprawka v11.3: odczyt ceny wyzwolenia uwzględniający zarówno SL jak i TP
                     actual_px_str = item.get("actualPx") or item.get("slTriggerPx") or item.get("tpTriggerPx") or "0"
                     try:
                         actual_px = float(actual_px_str)
                     except ValueError:
                         actual_px = None
                     return state, actual_px
-                # Bezpieczna obsługa kodów OKX: zlecenie wyzwolone / zrealizowane / przeniesione do historii
                 if code in ("51402", "51401", "51410", "51415"):
                     return "effective", None
                 return None, None
@@ -1064,7 +1092,6 @@ async def reconcile_and_timestop(
         elapsed_time = time.time() - opened_at
         max_timeout = CONFIG["TIMEOUTS"].get(strategy_type, 28800)
 
-        # Stany terminalne zleceń OCO w OKX: 'effective' oznacza wyzwolenie i realizację SL/TP
         TERMINAL_ALGO_STATES = ("effective", "filled", "canceled", "order_failed")
 
         # 1. Sprawdzenie Strażnika Czasu (Time-Stop)
@@ -1129,6 +1156,10 @@ async def reconcile_and_timestop(
                         f"Slot zwolniony. Kapitał w gotówce."
                     )
                 else:
+                    # KWARANTANNA PO STOP LOSS
+                    cooldown_sec = CONFIG.get("RISK_MANAGEMENT", {}).get("COOLDOWN_AFTER_SL_SEC", 14400)
+                    await redis_trade.set_cooldown(inst["symbol"], cooldown_sec)
+                    logger.info(f"❄️ [COOLDOWN] Nałożono kwarantannę na {inst['label']} na {cooldown_sec//3600}h po zaliczeniu SL.")
                     await tg.push(
                         f"🛑 <b>[STOP LOSS: {inst['label']}] • OCHRONA</b>\n"
                         f"──────────────────────────────\n"
@@ -1138,7 +1169,7 @@ async def reconcile_and_timestop(
                         f"──────────────────────────────\n"
                         f"📉 <b>Strata netto: {pnl_net} {QUOTE_CCY} ({roe_net}%)</b>\n"
                         f"🛡️ Prowizja giełdowa: uwzględniona\n"
-                        f"Slot zwolniony. Kapitał zabezpieczony."
+                        f"Slot zwolniony. Kwarantanna: {cooldown_sec//3600}h."
                     )
             return True, pos_key
 
@@ -1158,14 +1189,15 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
 
     while not ASYNC_SHUTDOWN_EVENT.is_set():
         try:
-            # 1. Uzgadnianie statusu i obsługa Strażnika Czasu (18h)
             for inst in instruments:
                 await reconcile_and_timestop(inst, "MEAN_REVERSION", redis_trade, tg)
 
-            # 2. Skanowanie sygnałów w strefie chronionej zamkiem atomowym
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
+
+                if await redis_trade.is_in_cooldown(inst["symbol"]):
+                    continue
 
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                 pos_check = await redis_trade.get_position_state(pos_key)
@@ -1213,9 +1245,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                              rsi <= CONFIG["STRATEGY_PARAMS"]["MEAN_REVERSION"]["RSI_CRASH"])
 
                 if std_buy or crash_buy:
-                    # WEJŚCIE DO SEKCJI KRYTYCZNEJ ALFA
                     async with GLOBAL_ALPHA_LOCK:
-                        # Weryfikacja dostępności slotów wewnątrz zamka
                         url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                         async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
                             active_keys = (await r_k.json()).get("result", []) if r_k.status == 200 else []
@@ -1327,6 +1357,9 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
+
+                if await redis_trade.is_in_cooldown(inst["symbol"]):
+                    continue
 
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                 pos_check = await redis_trade.get_position_state(pos_key)
@@ -1463,6 +1496,9 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
             for inst in instruments:
                 if ASYNC_SHUTDOWN_EVENT and ASYNC_SHUTDOWN_EVENT.is_set():
                     break
+
+                if await redis_trade.is_in_cooldown(inst["symbol"]):
+                    continue
 
                 pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
                 pos_check = await redis_trade.get_position_state(pos_key)
