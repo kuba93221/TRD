@@ -893,15 +893,20 @@ class OKXSpotClient:
                 if resp.status != 200:
                     return None, None
                 data = await resp.json()
-                if data.get("code") == "0" and data.get("data"):
+                code = str(data.get("code", ""))
+                if code == "0" and data.get("data"):
                     item = data["data"][0]
                     state = item.get("state")
-                    actual_px_str = item.get("actualPx") or item.get("tpTriggerPx") or "0"
+                    # Poprawka v11.3: odczyt ceny wyzwolenia uwzględniający zarówno SL jak i TP
+                    actual_px_str = item.get("actualPx") or item.get("slTriggerPx") or item.get("tpTriggerPx") or "0"
                     try:
                         actual_px = float(actual_px_str)
                     except ValueError:
                         actual_px = None
                     return state, actual_px
+                # Bezpieczna obsługa kodów OKX: zlecenie wyzwolone / zrealizowane / przeniesione do historii
+                if code in ("51402", "51401", "51410", "51415"):
+                    return "effective", None
                 return None, None
         except Exception as e:
             logger.error(f"❌ [OKX-ALGO-STATE] Błąd zlecenia Algo {algo_id}: {e}")
@@ -1059,8 +1064,11 @@ async def reconcile_and_timestop(
         elapsed_time = time.time() - opened_at
         max_timeout = CONFIG["TIMEOUTS"].get(strategy_type, 28800)
 
+        # Stany terminalne zleceń OCO w OKX: 'effective' oznacza wyzwolenie i realizację SL/TP
+        TERMINAL_ALGO_STATES = ("effective", "filled", "canceled", "order_failed")
+
         # 1. Sprawdzenie Strażnika Czasu (Time-Stop)
-        if algo_state not in ["filled", "canceled", "order_failed"] and elapsed_time > max_timeout:
+        if algo_state not in TERMINAL_ALGO_STATES and elapsed_time > max_timeout:
             logger.warning(f"⏳ [TIME-STOP EXPIRED] Pozycja {inst['label']} ({strategy_type}) przekroczyła {round(max_timeout/3600, 1)}h. Likwidacja...")
             await inst["client"].cancel_algo_order(inst["symbol"], algo_id)
             
@@ -1085,12 +1093,12 @@ async def reconcile_and_timestop(
             )
             return True, pos_key
 
-        # 2. Sprawdzenie realizacji na giełdzie (Filled / Canceled)
-        if algo_state in ["filled", "canceled", "order_failed"]:
+        # 2. Sprawdzenie realizacji na giełdzie (Effective / Filled / Canceled)
+        if algo_state in TERMINAL_ALGO_STATES:
             logger.info(f"🧹 [RECONCILE] Zlecenie OCO {inst['label']} zakończone stanem: {algo_state}.")
             await redis_trade.delete_key(pos_key)
 
-            if algo_state == "filled":
+            if algo_state in ("effective", "filled"):
                 buy_p = float(pos_data.get("buy_price", 0.0))
                 qty_p = float(pos_data.get("qty", 0.0))
                 tp_p = float(pos_data.get("tp_price", buy_p * 1.03))
