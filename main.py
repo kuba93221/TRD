@@ -11,70 +11,40 @@ import threading
 import hmac
 import hashlib
 import base64
+import sys
 from datetime import datetime, UTC
 from flask import Flask, jsonify, request
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 # =========================================================================
-# CENTRALNA DYSPOZYTORNIA PARAMETRÓW I ZARZĄDZANIA RYZYKIEM (CONFIG v11.3)
+# SYSTEMOWY MODUŁ OBSERVABILITY & GLOBAL CONTEXT (v11.3 TELEMETRY READY)
 # =========================================================================
-CONFIG: Dict[str, Any] = {
-    "RISK_PER_TRADE_PCT": 0.01,       # 1.0% całkowitego portfela na transakcję
-    "MAX_POSITION_PORTFOLIO_RATIO": 0.18, # Maksymalnie 18% portfela w jednej pozycji
-    "MIN_ORDER_VALUE_USDC": 11.0,     # Minimalna wartość zlecenia na giełdzie OKX SPOT
-    "RESERVE_CASH_BUFFER_USDC": 2.0,  # Żelazna rezerwa nienaruszalna w gotówce
-    "ALPHA_MAX_ACTIVE_SLOTS": 3,      # Maksymalna łączna liczba otwartych pozycji ALFA
-    "GRID_MAX_ACTIVE_LEVELS": 3,      # Maksymalna liczba poziomów dla siatki GRID
-    "TIMEOUTS": {
-        "MOMENTUM": 8 * 3600,         # 8 godzin (28800 s)
-        "BREAKOUT": 8 * 3600,         # 8 godzin (28800 s)
-        "MEAN_REVERSION": 18 * 3600   # 18 godzin (64800 s)
-    },
-    "DYNAMIC_RISK": {
-        "MIN_SL_PCT": 0.008,          # Minimalny próg SL: 0.8% (ochrona przed szumem)
-        "MAX_SL_HARD_CAP": 0.020,     # MAKSYMALNY KAGANIEC DYREKTORA: 2.0%
-        "DEFAULT_SL_PCT": 0.015       # Domyślny SL przy braku danych ATR: 1.5%
-    },
-    "STRATEGY_PARAMS": {
-        "MOMENTUM": {
-            "ROC_PERIOD": 10,
-            "ROC_TRIGGER": 2.0,        # Wzrost > 2.0%
-            "ATR_SL_MULT": 1.5,        # SL = 1.5 * ATR
-            "RR_RATIO": 1.5            # TP = 1.5 * SL
-        },
-        "BREAKOUT": {
-            "BB_PERIOD": 20,
-            "COMPRESSION_BANDWIDTH": 0.015,
-            "ATR_SL_MULT": 1.5,
-            "RR_RATIO": 2.0            # TP = 2.0 * SL
-        },
-        "MEAN_REVERSION": {
-            "Z_BUY_STANDARD": -1.5,
-            "RSI_STANDARD": 35,
-            "Z_BUY_CRASH": -2.5,
-            "RSI_CRASH": 20,
-            "ATR_SL_MULT": 2.0,
-            "RR_RATIO": 1.5
-        },
-        "GRID": {
-            "GRID_STEP_PCT": 0.005,    # 0.5% odległość siatki
-            "LEVELS": 3,
-            "SL_PCT": 0.015,           # 1.5% Stop Loss siatki
-            "TP_PCT": 0.005            # 0.5% Take Profit poziomu
-        }
-    }
-}
+# Wymuszenie natychmiastowego zrzutu logów w kontenerze Render (brak buforowania)
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
-# =========================================================================
-# SYSTEMOWY MODUŁ OBSERVABILITY & GLOBAL CONTEXT
-# =========================================================================
+class FlushStreamHandler(logging.StreamHandler):
+    """Gwarantuje natychmiastowe wypychanie logów do konsoli Rendera bez czekania na bufor."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
 LOG_LEVEL_CONFIG = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL_CONFIG, logging.INFO),
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger("TradingEngine_OKX_PRODUCTION_v11.3")
+logger.setLevel(getattr(logging, LOG_LEVEL_CONFIG, logging.INFO))
+logger.handlers.clear()
+
+_stream_handler = FlushStreamHandler(sys.stdout)
+_stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(_stream_handler)
+logger.propagate = False
+
+# Natychmiastowy meldunek startowy widoczny w 0.1s po deployu
+print("🚀 [BOOT] Silnik transakcyjny v11.3 inicjalizuje telemetrie na Renderze...", flush=True)
 
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
 logger.info(f"⚙️ [SYSTEM-INIT] Silnik v11.3 Online [ATOMOWY LOCK | DYNAMIC ATR SL/TP | LIVE: {not IS_SANDBOX}]")
@@ -639,7 +609,10 @@ class OKXWebSocketPriceFeed:
                                 inst_id = ticker.get("instId")
                                 last_price = ticker.get("last")
                                 if inst_id and last_price:
+                                    prev_p = self.latest_prices.get(inst_id)
                                     self.latest_prices[inst_id] = float(last_price)
+                                    if prev_p is None:
+                                        logger.info(f"📡 [WS-FEED] Odebrano pierwszy kurs dla {inst_id}: {last_price} {QUOTE_CCY}")
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             logger.warning("⚠️ [WS-DISCONNECTED] Gniazdo zamknięte. Ponawianie...")
                             break
@@ -1134,23 +1107,37 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
 
                 ticker = await inst["client"].get_market_ticker(inst["symbol"])
                 if not ticker:
+                    logger.warning(f"⚠️ [{inst['label']}] Brak kwotowania SPOT. Oczekiwanie na feed...")
                     continue
 
                 current_price = ticker.get("last", 0.0)
                 await redis_trade.push_historical_tick(inst["label"], ticker, max_elements=50)
                 history = await redis_trade.get_historical_ticks(inst["label"], max_elements=50)
-                if len(history) < 20:
+                samples_count = len(history)
+
+                logger.info(f"📥 [{inst['label']}] Kurs SPOT: {current_price} {QUOTE_CCY} | Bufor Redis: {samples_count}/20 próbek")
+
+                if samples_count < 20:
+                    logger.info(f"⏳ [{inst['label']}] Zbieranie historii ({samples_count}/20)... Silnik wstrzymuje analizę.")
                     continue
 
                 macro_candles = await inst["client"].get_macro_candles(inst["symbol"], bar="1H", limit=30)
                 metrics = AlgorithmicQuantCore.calculate_z_score(history, macro_candles)
-                if not metrics or metrics["bandwidth"] < 0.001:
+                if not metrics:
                     continue
 
                 z = metrics["z_score"]
                 rsi = metrics["rsi"]
                 trend = metrics["trend"]
                 atr = metrics["atr"]
+                bandwidth = metrics["bandwidth"]
+
+                logger.info(f"📊 [MEAN-REV-SCAN] {inst['label']} | P: {current_price} | Z: {z} | RSI: {rsi} | Bw: {bandwidth} | Trend: {trend}")
+                await redis_trade.incr_metric(f"ticks_{inst['label']}")
+
+                if bandwidth < 0.001:
+                    logger.info(f"⚠️ [{inst['label']}] Blokada: BandWidth skrajnie niski ({bandwidth}). Rynek w kompresji.")
+                    continue
 
                 std_buy = (z <= CONFIG["STRATEGY_PARAMS"]["MEAN_REVERSION"]["Z_BUY_STANDARD"] and 
                            trend == "LONG_ONLY" and 
@@ -1277,13 +1264,18 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                 if not candles_raw:
                     continue
 
-                if MarketRegimeArbitrator.get_regime(candles_raw) == "RANGING":
+                regime = MarketRegimeArbitrator.get_regime(candles_raw)
+                if regime == "RANGING":
+                    logger.info(f"🛑 [MOMENTUM-REGIME] {inst['label']} w reżimie RANGING. Momentum wygaszone.")
                     continue
 
                 mom_metrics = MomentumQuantCore.calculate_momentum(
                     candles_raw, 
                     period=CONFIG["STRATEGY_PARAMS"]["MOMENTUM"]["ROC_PERIOD"]
                 )
+
+                if mom_metrics:
+                    logger.info(f"📈 [MOMENTUM-SCAN] {inst['label']} | Reżim: {regime} | ROC: {mom_metrics['roc']}% (Próg: > {CONFIG['STRATEGY_PARAMS']['MOMENTUM']['ROC_TRIGGER']}%) | P: {mom_metrics['current']}")
 
                 if mom_metrics and mom_metrics["signal"]:
                     async with GLOBAL_ALPHA_LOCK:
@@ -1402,10 +1394,14 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                 if not candles_raw:
                     continue
 
+                regime = MarketRegimeArbitrator.get_regime(candles_raw)
                 brk_metrics = BreakoutQuantCore.calculate_breakout(
                     candles_raw, 
                     period=CONFIG["STRATEGY_PARAMS"]["BREAKOUT"]["BB_PERIOD"]
                 )
+
+                if brk_metrics:
+                    logger.info(f"💥 [BREAKOUT-SCAN] {inst['label']} | Reżim: {regime} | Bw: {brk_metrics['bandwidth']} (Komp < {CONFIG['STRATEGY_PARAMS']['BREAKOUT']['COMPRESSION_BANDWIDTH']}) | P: {brk_metrics['current']} vs Banda: {brk_metrics['upper_band']}")
 
                 if brk_metrics and brk_metrics["signal"]:
                     async with GLOBAL_ALPHA_LOCK:
@@ -1617,7 +1613,13 @@ async def independent_grid_worker(session, redis_trade, tg, okx_client):
                     continue
 
                 candles_raw = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
-                if not candles_raw or MarketRegimeArbitrator.get_regime(candles_raw) == "TRENDING":
+                if not candles_raw:
+                    continue
+
+                regime = MarketRegimeArbitrator.get_regime(candles_raw)
+                logger.info(f"🧱 [GRID-SCAN] {inst['label']} | Reżim: {regime} | Aktywne poziomy GRID: {grid_active_count}/{CONFIG['GRID_MAX_ACTIVE_LEVELS']}")
+
+                if regime == "TRENDING":
                     continue
 
                 grid_metrics = GridQuantCore.calculate_grid_levels(
@@ -1625,6 +1627,9 @@ async def independent_grid_worker(session, redis_trade, tg, okx_client):
                     grid_step_pct=CONFIG["STRATEGY_PARAMS"]["GRID"]["GRID_STEP_PCT"], 
                     levels=CONFIG["STRATEGY_PARAMS"]["GRID"]["LEVELS"]
                 )
+
+                if grid_metrics:
+                    logger.info(f"🧱 [GRID-METRICS] {inst['label']} | ATR: {grid_metrics['atr_pct']}% | ROC: {grid_metrics['roc']}% | Konsolidacja: {grid_metrics['is_consolidation']}")
 
                 if grid_metrics and grid_metrics["is_consolidation"]:
                     first_lvl = grid_metrics["levels"][0]
@@ -1711,8 +1716,14 @@ async def continuous_async_cron(loop):
             tasks.append(asyncio.create_task(independent_breakout_worker(session, redis_trade, tg, okx_client)))
             tasks.append(asyncio.create_task(independent_grid_worker(session, redis_trade, tg, okx_client)))
 
+            heartbeat_timer = 0
             while not ASYNC_SHUTDOWN_EVENT.is_set():
                 await asyncio.sleep(1)
+                heartbeat_timer += 1
+                if heartbeat_timer >= 60:
+                    heartbeat_timer = 0
+                    prices_count = len(ws_feed.latest_prices)
+                    logger.info(f"💓 [ENGINE-HEARTBEAT] Wszystkie 4 workery aktywne | WebSocket Feed: {prices_count}/4 par | Pętla OK")
 
         except Exception as e:
             logger.error(f"❌ [CRON-FATAL] Awaria pętli: {e}")
