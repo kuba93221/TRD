@@ -57,6 +57,55 @@ GLOBAL_WS_FEED: Optional[Any] = None
 
 QUOTE_CCY = "USDC"
 
+# =========================================================================
+# CENTRALNA KONFIGURACJA PARAMETRYCZNA (v11.3)
+# =========================================================================
+CONFIG = {
+    "ALPHA_MAX_ACTIVE_SLOTS": 3,
+    "GRID_MAX_ACTIVE_LEVELS": 3,
+    "MIN_ORDER_VALUE_USDC": 11.0,
+    "RESERVE_CASH_BUFFER_USDC": 2.0,
+    "RISK_PER_TRADE_PCT": 0.01,
+    "MAX_POSITION_PORTFOLIO_RATIO": 0.18,
+    "DYNAMIC_RISK": {
+        "MIN_SL_PCT": 0.008,
+        "MAX_SL_HARD_CAP": 0.020,
+        "DEFAULT_SL_PCT": 0.015
+    },
+    "TIMEOUTS": {
+        "MOMENTUM": 8 * 3600,
+        "BREAKOUT": 8 * 3600,
+        "MEAN_REVERSION": 18 * 3600
+    },
+    "STRATEGY_PARAMS": {
+        "MEAN_REVERSION": {
+            "Z_BUY_STANDARD": -1.5,
+            "Z_BUY_CRASH": -2.5,
+            "RSI_STANDARD": 35.0,
+            "RSI_CRASH": 20.0,
+            "ATR_SL_MULT": 2.0,
+            "RR_RATIO": 1.5
+        },
+        "MOMENTUM": {
+            "ROC_PERIOD": 10,
+            "ROC_TRIGGER": 2.0,
+            "ATR_SL_MULT": 1.5,
+            "RR_RATIO": 1.5
+        },
+        "BREAKOUT": {
+            "BB_PERIOD": 20,
+            "COMPRESSION_BANDWIDTH": 0.015,
+            "ATR_SL_MULT": 1.5,
+            "RR_RATIO": 2.0
+        },
+        "GRID": {
+            "GRID_STEP_PCT": 0.005,
+            "LEVELS": 3,
+            "SL_PCT": 0.015
+        }
+    }
+}
+
 def floor_to_precision(value: float, precision: int) -> float:
     """Rygorystyczne obcinanie wartości w dół bez ryzyka zaokrąglenia w górę."""
     factor = 10 ** precision
