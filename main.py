@@ -1097,11 +1097,22 @@ async def reconcile_and_timestop(
         # 1. Sprawdzenie Strażnika Czasu (Time-Stop)
         if algo_state not in TERMINAL_ALGO_STATES and elapsed_time > max_timeout:
             logger.warning(f"⏳ [TIME-STOP EXPIRED] Pozycja {inst['label']} ({strategy_type}) przekroczyła {round(max_timeout/3600, 1)}h. Likwidacja...")
-            await inst["client"].cancel_algo_order(inst["symbol"], algo_id)
+            
+            # Poprawka v11.3.2: Pętla retry dla pewności anulowania OCO na giełdzie
+            cancel_success = False
+            for attempt in range(3):
+                if await inst["client"].cancel_algo_order(inst["symbol"], algo_id):
+                    cancel_success = True
+                    break
+                await asyncio.sleep(1.0)
+            
+            if not cancel_success:
+                logger.error(f"❌ [TIME-STOP CRITICAL] Nie udało się anulować OCO {algo_id} dla {inst['label']} po 3 próbach! Przerwanie likwidacji.")
+                return False, None
             
             base_ccy = inst["symbol"].split("-")[0]
             qty_to_sell = float(pos_data.get("qty", 0.0))
-            avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=2)
+            avail_bal = await inst["client"].wait_for_settled_balance(base_ccy, qty_to_sell * 0.95, max_attempts=3)
             
             if avail_bal >= inst["min_qty"]:
                 sell_qty = floor_to_precision(min(qty_to_sell, avail_bal), inst["round_digits"])
