@@ -68,6 +68,10 @@ CONFIG = {
     "RISK_MANAGEMENT": {
         "COOLDOWN_AFTER_SL_SEC": 14400  # 4 godziny kwarantanny po uderzeniu w Stop Loss
     },
+    "BREAK_EVEN": {
+        "ENABLED": True,
+        "FEE_BUFFER_PCT": 0.0022  # +0.22% do ceny zakupu na pokrycie podwójnej prowizji Taker + bufor poślizgu
+    },
     "SMART_MONEY": {
         "ENABLED": True,
         "MAX_LONG_SHORT_RATIO": 2.2,  # Próg euforii tłumu - powyżej blokujemy zakupy (Bull Trap)
@@ -90,19 +94,22 @@ CONFIG = {
             "RSI_STANDARD": 35.0,
             "RSI_CRASH": 20.0,
             "ATR_SL_MULT": 2.0,
-            "RR_RATIO": 1.5
+            "RR_RATIO": 1.5,
+            "BE_TRIGGER_RATIO": 0.75  # Późne BE (75% drogi do TP) zapobiega wycięciu na podwójnym dnie
         },
         "MOMENTUM": {
             "ROC_PERIOD": 10,
             "ROC_TRIGGER": 2.0,
             "ATR_SL_MULT": 1.5,
-            "RR_RATIO": 1.5
+            "RR_RATIO": 1.5,
+            "BE_TRIGGER_RATIO": 0.60  # Aktywacja BE przy 60% drogi do Take Profit
         },
         "BREAKOUT": {
             "BB_PERIOD": 20,
             "COMPRESSION_BANDWIDTH": 0.015,
             "ATR_SL_MULT": 1.5,
-            "RR_RATIO": 2.0
+            "RR_RATIO": 2.0,
+            "BE_TRIGGER_RATIO": 0.55  # Szybkie BE przy 55% drogi do TP po wybiciu
         },
         "GRID": {
             "GRID_STEP_PCT": 0.005,
@@ -1183,6 +1190,41 @@ class OKXSpotClient:
             logger.error(f"❌ [OKX-CANCEL-ALGO] Błąd OCO {algo_id}: {e}")
             return False
 
+    async def amend_algo_order(self, symbol: str, algo_id: str, new_sl_trigger_px: float) -> bool:
+        """Atomowa modyfikacja w locie (In-Place Amendment) wyzwalacza Stop Loss w aktywnym zleceniu OCO.
+        Zlecenie ani na nanosekundę nie opuszcza silnika dopasowującego giełdy OKX."""
+        if not self.api_key or not self.secret_key or not self.passphrase:
+            return False
+        await self.rate_limiter.consume()
+
+        request_path = "/api/v5/trade/amend-algos"
+        body_dict = {
+            "instId": symbol,
+            "algoId": str(algo_id),
+            "newSlTriggerPx": str(new_sl_trigger_px),
+            "newSlOrdPx": "-1"
+        }
+        body_json = json.dumps(body_dict)
+        url = f"{self.base_url}{request_path}"
+        headers = self._get_headers("POST", request_path, body_json)
+
+        try:
+            async with self.session.post(url, data=body_json, headers=headers, timeout=5) as r:
+                data = await r.json()
+                if data.get("code") == "0" and data.get("data"):
+                    item = data["data"][0]
+                    s_code = str(item.get("sCode", ""))
+                    if s_code == "0":
+                        logger.info(f"🛡️ [OKX-AMEND-SUCCESS] Zaktualizowano OCO {algo_id} ({symbol}): newSlTriggerPx={new_sl_trigger_px}")
+                        return True
+                    logger.warning(f"⚠️ [OKX-AMEND-REJECTED] Odrzucono modyfikację OCO {algo_id} (sCode {s_code}): {item.get('sMsg')}")
+                    return False
+                logger.warning(f"⚠️ [OKX-AMEND-ERROR] Błąd API OKX: {data.get('code')} - {data.get('msg')}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ [OKX-AMEND-EX] Wyjątek modyfikacji OCO {algo_id}: {e}")
+            return False
+
     async def execute_oco_protection(self, symbol: str, quantity: float, price_tp: float, price_sl: float) -> Optional[Dict[str, Any]]:
         if not self.api_key or not self.secret_key or not self.passphrase:
             return None
@@ -1222,7 +1264,7 @@ async def reconcile_and_timestop(
     redis_trade: UpstashRedisTradingBridge, 
     tg: TelegramThrottledDispatcher
 ) -> Tuple[bool, Optional[str]]:
-    """Uniwersalny moduł sprawdzania stanu zlecenia OCO oraz wygaszania pozycji po czasie."""
+    """Uniwersalny moduł sprawdzania stanu zlecenia OCO, Break Even w locie oraz wygaszania pozycji po czasie."""
     pos_key = f"POS_ACTIVE:ALPHA:{inst['label']}"
     pos_data = await redis_trade.get_position_state(pos_key)
     if not pos_data:
@@ -1274,7 +1316,46 @@ async def reconcile_and_timestop(
             )
             return True, pos_key
 
-        # 2. Sprawdzenie realizacji na giełdzie (Effective / Filled / Canceled)
+        # 2. Sprawdzenie i Aktywacja Break Even w locie (In-Place Amendment przez POST /api/v5/trade/amend-algos)
+        be_config = CONFIG.get("BREAK_EVEN", {})
+        if be_config.get("ENABLED", True) and algo_state not in TERMINAL_ALGO_STATES and not pos_data.get("be_applied", False):
+            buy_p = float(pos_data.get("buy_price", 0.0))
+            tp_p = float(pos_data.get("tp_price", 0.0))
+            old_sl = float(pos_data.get("sl_price", 0.0))
+
+            if buy_p > 0 and tp_p > buy_p:
+                trigger_ratio = CONFIG["STRATEGY_PARAMS"].get(strategy_type, {}).get("BE_TRIGGER_RATIO", 0.60)
+                be_trigger_px = buy_p + (trigger_ratio * (tp_p - buy_p))
+
+                curr_px = GLOBAL_WS_FEED.get_last_price(inst["symbol"]) if GLOBAL_WS_FEED else None
+                if not curr_px:
+                    ticker = await inst["client"].get_market_ticker(inst["symbol"])
+                    curr_px = ticker.get("last", 0.0) if ticker else 0.0
+
+                if curr_px and curr_px >= be_trigger_px:
+                    fee_buffer = be_config.get("FEE_BUFFER_PCT", 0.0022)
+                    new_sl_price = round(buy_p * (1.0 + fee_buffer), inst["price_round"])
+
+                    if new_sl_price > old_sl and curr_px > new_sl_price:
+                        amend_success = await inst["client"].amend_algo_order(inst["symbol"], algo_id, new_sl_price)
+                        if amend_success:
+                            pos_data["be_applied"] = True
+                            pos_data["sl_price"] = new_sl_price
+                            await redis_trade.set_position_state(pos_key, pos_data)
+                            gain_pct = round(((curr_px - buy_p) / buy_p) * 100.0, 2)
+                            logger.info(f"🛡️ [BREAK-EVEN ACTIVE] {inst['label']} ({strategy_type}): SL w locie -> {new_sl_price} {QUOTE_CCY} (+{round(fee_buffer*100, 2)}%) przy kursie {curr_px} (+{gain_pct}%).")
+                            await tg.push(
+                                f"🛡️ <b>[BREAK EVEN: {inst['label']}] • POZYCJA ZABEZPIECZONA</b>\n"
+                                f"──────────────────────────────\n"
+                                f"📈 Strategia: <b>{strategy_type}</b>\n"
+                                f"💰 Wejście: <b>{buy_p} {QUOTE_CCY}</b> | Aktualny: <b>{curr_px} {QUOTE_CCY} (+{gain_pct}%)</b>\n"
+                                f"🎯 Take Profit: <code>{tp_p} {QUOTE_CCY}</code>\n"
+                                f"🛑 Nowy Stop Loss (BE): <code>{new_sl_price} {QUOTE_CCY} (+{round(fee_buffer*100, 2)}%)</code>\n"
+                                f"──────────────────────────────\n"
+                                f"🔒 <b>Prowizje zabezpieczone. Ryzyko wyzerowane w locie (amend-algos).</b>"
+                            )
+
+        # 3. Sprawdzenie realizacji na giełdzie (Effective / Filled / Canceled)
         if algo_state in TERMINAL_ALGO_STATES:
             logger.info(f"🧹 [RECONCILE] Zlecenie OCO {inst['label']} zakończone stanem: {algo_state}.")
             await redis_trade.delete_key(pos_key)
@@ -1461,7 +1542,8 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
                                     "sl_price": price_sl,
                                     "sl_pct": sl_pct,
                                     "time": now_ts,
-                                    "type": "MEAN_REVERSION"
+                                    "type": "MEAN_REVERSION",
+                                    "be_applied": False
                                 })
                                 total_cost = round(oco_qty * current_price, 2)
                                 await tg.push(
@@ -1611,7 +1693,8 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                                     "sl_price": price_sl,
                                     "sl_pct": sl_pct,
                                     "time": now_ts,
-                                    "type": "MOMENTUM"
+                                    "type": "MOMENTUM",
+                                    "be_applied": False
                                 })
                                 total_cost = round(oco_qty * current_price, 2)
                                 await tg.push(
@@ -1757,7 +1840,8 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                                     "sl_price": price_sl,
                                     "sl_pct": sl_pct,
                                     "time": now_ts,
-                                    "type": "BREAKOUT"
+                                    "type": "BREAKOUT",
+                                    "be_applied": False
                                 })
                                 total_cost = round(oco_qty * current_price, 2)
                                 await tg.push(
