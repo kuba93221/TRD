@@ -45,7 +45,7 @@ logger.propagate = False
 print("🚀 [BOOT] Silnik transakcyjny v11.3 inicjalizuje telemetrie na Renderze...", flush=True)
 
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
-logger.info(f"⚙️ [SYSTEM-INIT] Silnik v11.3 Online [ATOMOWY LOCK | DYNAMIC ATR SL/TP | LIVE: {not IS_SANDBOX}]")
+logger.info(f"⚙️ [SYSTEM-INIT] Silnik v11.3 Online [ATOMOWY LOCK | SMART MONEY FILTER | LIVE: {not IS_SANDBOX}]")
 
 BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
 GLOBAL_ALPHA_LOCK: Optional[asyncio.Lock] = None
@@ -67,6 +67,11 @@ CONFIG = {
     "MAX_POSITION_PORTFOLIO_RATIO": 0.18,
     "RISK_MANAGEMENT": {
         "COOLDOWN_AFTER_SL_SEC": 14400  # 4 godziny kwarantanny po uderzeniu w Stop Loss
+    },
+    "SMART_MONEY": {
+        "ENABLED": True,
+        "MAX_LONG_SHORT_RATIO": 2.2,  # Próg euforii tłumu - powyżej blokujemy zakupy (Bull Trap)
+        "CACHE_TTL_SEC": 180          # Bufor pamięci podręcznej dla odczytów sentymentu
     },
     "DYNAMIC_RISK": {
         "MIN_SL_PCT": 0.008,
@@ -295,6 +300,36 @@ def web_test_okx_grid_permissions():
     return jsonify(report), 200
 
 # =========================================================================
+# DIAGNOSTYKA SENTYMENTU SMART MONEY (OKX RUBIK API)
+# =========================================================================
+@app.route('/test-sentiment', methods=['GET'])
+def route_test_sentiment():
+    """Diagnostyczny endpoint weryfikujący na żywo odczyty sentymentu Smart Money z OKX Rubik."""
+    if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
+        return jsonify({"status": "ERROR", "message": "Pętla bota nie jest aktywna."}), 503
+
+    async def _fetch():
+        async with aiohttp.ClientSession() as s:
+            client = OKXSpotClient(s, TokenBucketRateLimiter(4.0, 8.0), is_sandbox=IS_SANDBOX)
+            results = {}
+            for coin in ["BTC", "ETH", "SOL", "XRP"]:
+                ratio = await client.get_smart_money_sentiment(coin)
+                results[coin] = ratio if ratio is not None else "BRAK_DANYCH"
+            return results
+
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_fetch(), BACKGROUND_LOOP)
+        data = fut.result(timeout=7.0)
+        return jsonify({
+            "status": "OK",
+            "smart_money_sentiment": data,
+            "threshold_max_ratio": CONFIG.get("SMART_MONEY", {}).get("MAX_LONG_SHORT_RATIO", 2.2),
+            "filter_enabled": CONFIG.get("SMART_MONEY", {}).get("ENABLED", True)
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "ERROR", "message": str(e)}), 500
+
+# =========================================================================
 # TOKEN BUCKET RATE LIMITER
 # =========================================================================
 class TokenBucketRateLimiter:
@@ -462,9 +497,6 @@ class UpstashRedisTradingBridge:
         except Exception:
             pass
 
-    # ==========================================
-    # MODUŁ KWARANTANNY (COOLDOWN)
-    # ==========================================
     async def set_cooldown(self, symbol: str, seconds: int) -> bool:
         """Ustawia kwarantannę dla symbolu na X sekund."""
         if not self.url:
@@ -478,7 +510,7 @@ class UpstashRedisTradingBridge:
             return False
 
     async def is_in_cooldown(self, symbol: str) -> bool:
-        """Sprawdza, czy moneta jest obecnie w kwarantannie."""
+        """Sprawdza, czy moneta jest obecnie w kwarantannie po Stop Loss."""
         if not self.url:
             return False
         safe_key = self._enforce_prefix(f"COOLDOWN:{symbol}")
@@ -789,6 +821,7 @@ class OKXSpotClient:
         self.api_key = os.environ.get("OKX_API_KEY", "").strip()
         self.secret_key = os.environ.get("OKX_SECRET_KEY", "").strip()
         self.passphrase = os.environ.get("OKX_PASSPHRASE", "").strip()
+        self._sentiment_cache: Dict[str, Tuple[float, float]] = {}
 
     def _generate_timestamp(self) -> str:
         return datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
@@ -810,6 +843,42 @@ class OKXSpotClient:
         if self.is_sandbox:
             headers["x-simulated-trading"] = "1"
         return headers
+
+    async def get_smart_money_sentiment(self, ccy: str = "BTC") -> Optional[float]:
+        """Pobiera platformowy wskaźnik Long/Short Ratio czołowych traderów z API Rubik OKX z fallbackiem makro BTC."""
+        now = time.monotonic()
+        ttl = CONFIG.get("SMART_MONEY", {}).get("CACHE_TTL_SEC", 180)
+        if ccy in self._sentiment_cache:
+            val, ts = self._sentiment_cache[ccy]
+            if now - ts < ttl:
+                return val
+
+        request_path = f"/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy={ccy}&period=5m"
+        url = f"{self.base_url}{request_path}"
+        headers = {"Content-Type": "application/json"}
+        if self.is_sandbox:
+            headers["x-simulated-trading"] = "1"
+
+        try:
+            async with self.session.get(url, headers=headers, timeout=4) as resp:
+                if resp.status != 200:
+                    if ccy != "BTC":
+                        return await self.get_smart_money_sentiment("BTC")
+                    return None
+                data = await resp.json()
+                if data.get("code") == "0" and data.get("data") and len(data["data"]) > 0:
+                    raw_ratio = data["data"][0][1]
+                    ratio = float(raw_ratio)
+                    self._sentiment_cache[ccy] = (ratio, now)
+                    return ratio
+                elif ccy != "BTC":
+                    return await self.get_smart_money_sentiment("BTC")
+                return None
+        except Exception as e:
+            logger.warning(f"⚠️ [OKX-SMART-MONEY] Błąd sentymentu dla {ccy}: {e}")
+            if ccy != "BTC":
+                return await self.get_smart_money_sentiment("BTC")
+            return None
 
     async def get_wallet_balances(self, ccy: str = "USDC") -> Dict[str, float]:
         if not self.api_key or not self.secret_key or not self.passphrase:
@@ -1173,7 +1242,6 @@ async def reconcile_and_timestop(
         if algo_state not in TERMINAL_ALGO_STATES and elapsed_time > max_timeout:
             logger.warning(f"⏳ [TIME-STOP EXPIRED] Pozycja {inst['label']} ({strategy_type}) przekroczyła {round(max_timeout/3600, 1)}h. Likwidacja...")
             
-            # Poprawka v11.3.2: Pętla retry dla pewności anulowania OCO na giełdzie
             cancel_success = False
             for attempt in range(3):
                 if await inst["client"].cancel_algo_order(inst["symbol"], algo_id):
@@ -1242,7 +1310,6 @@ async def reconcile_and_timestop(
                         f"Slot zwolniony. Kapitał w gotówce."
                     )
                 else:
-                    # KWARANTANNA PO STOP LOSS
                     cooldown_sec = CONFIG.get("RISK_MANAGEMENT", {}).get("COOLDOWN_AFTER_SL_SEC", 14400)
                     await redis_trade.set_cooldown(inst["symbol"], cooldown_sec)
                     logger.info(f"❄️ [COOLDOWN] Nałożono kwarantannę na {inst['label']} na {cooldown_sec//3600}h po zaliczeniu SL.")
@@ -1424,7 +1491,7 @@ async def independent_mean_reversion_worker(session, redis_trade, tg, okx_client
         await asyncio.sleep(60)
 
 # =========================================================================
-# STRATEGIA 2: INDEPENDENT MOMENTUM WORKER (KOSZYK ALFA)
+# STRATEGIA 2: INDEPENDENT MOMENTUM WORKER (KOSZYK ALFA + SMART MONEY FILTER)
 # =========================================================================
 async def independent_momentum_worker(session, redis_trade, tg, okx_client):
     logger.info("🚀 [MOMENTUM-WORKER] Uruchomiono wątek Momentum w tle.")
@@ -1470,6 +1537,17 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
                     logger.info(f"📈 [MOMENTUM-SCAN] {inst['label']} | Reżim: {regime} | ROC: {mom_metrics['roc']}% (Próg: > {CONFIG['STRATEGY_PARAMS']['MOMENTUM']['ROC_TRIGGER']}%) | P: {mom_metrics['current']}")
 
                 if mom_metrics and mom_metrics["signal"]:
+                    # FILTR SMART MONEY (SENTYMENT WIELORYBÓW)
+                    if CONFIG.get("SMART_MONEY", {}).get("ENABLED", True):
+                        base_coin = inst["symbol"].split("-")[0]
+                        max_ratio = CONFIG.get("SMART_MONEY", {}).get("MAX_LONG_SHORT_RATIO", 2.2)
+                        sentiment_ratio = await inst["client"].get_smart_money_sentiment(base_coin)
+                        if sentiment_ratio is not None:
+                            logger.info(f"🧠 [SMART-MONEY-CHECK] {inst['label']} (Momentum) | Stosunek L/S: {sentiment_ratio:.2f} (Próg max: {max_ratio})")
+                            if sentiment_ratio > max_ratio:
+                                logger.warning(f"🛡️ [SMART-MONEY-BLOCK] Odrzucono wejście {inst['label']} (Momentum)! Skrajna euforia tłumu (L/S: {sentiment_ratio:.2f} > {max_ratio}). Ryzyko Bull Trap!")
+                                continue
+
                     async with GLOBAL_ALPHA_LOCK:
                         url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                         async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
@@ -1563,7 +1641,7 @@ async def independent_momentum_worker(session, redis_trade, tg, okx_client):
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 3: INDEPENDENT BREAKOUT WORKER (KOSZYK ALFA)
+# STRATEGIA 3: INDEPENDENT BREAKOUT WORKER (KOSZYK ALFA + SMART MONEY FILTER)
 # =========================================================================
 async def independent_breakout_worker(session, redis_trade, tg, okx_client):
     logger.info("💥 [BREAKOUT-WORKER] Uruchomiono wątek Breakout w tle.")
@@ -1605,6 +1683,17 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
                     logger.info(f"💥 [BREAKOUT-SCAN] {inst['label']} | Reżim: {regime} | Bw: {brk_metrics['bandwidth']} (Komp < {CONFIG['STRATEGY_PARAMS']['BREAKOUT']['COMPRESSION_BANDWIDTH']}) | P: {brk_metrics['current']} vs Banda: {brk_metrics['upper_band']}")
 
                 if brk_metrics and brk_metrics["signal"]:
+                    # FILTR SMART MONEY (SENTYMENT WIELORYBÓW)
+                    if CONFIG.get("SMART_MONEY", {}).get("ENABLED", True):
+                        base_coin = inst["symbol"].split("-")[0]
+                        max_ratio = CONFIG.get("SMART_MONEY", {}).get("MAX_LONG_SHORT_RATIO", 2.2)
+                        sentiment_ratio = await inst["client"].get_smart_money_sentiment(base_coin)
+                        if sentiment_ratio is not None:
+                            logger.info(f"🧠 [SMART-MONEY-CHECK] {inst['label']} (Breakout) | Stosunek L/S: {sentiment_ratio:.2f} (Próg max: {max_ratio})")
+                            if sentiment_ratio > max_ratio:
+                                logger.warning(f"🛡️ [SMART-MONEY-BLOCK] Odrzucono wejście {inst['label']} (Breakout)! Skrajna euforia tłumu (L/S: {sentiment_ratio:.2f} > {max_ratio}). Ryzyko fałszywego wybicia!")
+                                continue
+
                     async with GLOBAL_ALPHA_LOCK:
                         url_keys = f"{redis_trade.url}/keys/{redis_trade.prefix}POS_ACTIVE:ALPHA:*"
                         async with session.get(url_keys, headers=redis_trade.headers, timeout=3) as r_k:
@@ -1698,7 +1787,7 @@ async def independent_breakout_worker(session, redis_trade, tg, okx_client):
         await asyncio.sleep(180)
 
 # =========================================================================
-# STRATEGIA 4: INDEPENDENT GRID WORKER (DEDYKOWANY KOSZYK GRID)
+# STRATEGIA 4: INDEPENDENT GRID WORKER (DEDYKOWANY KOSZYK GRID MULTI-ASSET)
 # =========================================================================
 async def independent_grid_worker(session, redis_trade, tg, okx_client):
     logger.info("🧱 [GRID-WORKER] Uruchomiono wątek Grid Trading w tle.")
@@ -1803,7 +1892,6 @@ async def independent_grid_worker(session, redis_trade, tg, okx_client):
                         )
                         continue
 
-                    # Sprawdzenie SL dla siatki GRID
                     current_market_price = GLOBAL_WS_FEED.get_last_price(inst["symbol"]) if GLOBAL_WS_FEED else None
                     if not current_market_price:
                         candles_check = await MarketRegimeArbitrator.get_candles(inst["client"], inst["symbol"])
@@ -1834,7 +1922,6 @@ async def independent_grid_worker(session, redis_trade, tg, okx_client):
                         )
                         continue
 
-                # Polowanie na nowy poziom GRID
                 if grid_active_count >= CONFIG["GRID_MAX_ACTIVE_LEVELS"]:
                     continue
 
