@@ -220,6 +220,81 @@ def web_test_okx_handshake():
     return jsonify(report), 200
 
 # =========================================================================
+# DIAGNOSTYKA UPRAWNIEŃ DLA NATYWNYCH BOTÓW GRID OKX EEA
+# =========================================================================
+@app.route('/test-grid', methods=['GET'])
+def web_test_okx_grid_permissions():
+    """Bezpieczny, nieinwazyjny test uprawnień do natywnych botów Grid (GET - read only)."""
+    import urllib.error
+
+    api_key = str(os.environ.get("OKX_API_KEY", "")).strip()
+    secret_key = str(os.environ.get("OKX_SECRET_KEY", "")).strip()
+    passphrase = str(os.environ.get("OKX_PASSPHRASE", "")).strip()
+    
+    base_url = os.environ.get("OKX_API_URL", "https://eea.okx.com").rstrip('/')
+    request_path = "/api/v5/tradingBot/grid/orders-algo-pending?algoOrdType=grid"
+
+    report = {
+        "test_type": "NATIVE_GRID_BOT_PERMISSION_CHECK",
+        "base_url": base_url,
+        "endpoint_queried": request_path,
+        "is_sandbox": IS_SANDBOX,
+        "permission_granted": False,
+        "details": {}
+    }
+
+    if not all([api_key, secret_key, passphrase]):
+        report["error"] = "Brak wymaganych zmiennych API w panelu Render!"
+        return jsonify(report), 400
+
+    timestamp = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+    message = f"{timestamp}GET{request_path}"
+    mac = hmac.new(secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
+    signature = base64.b64encode(mac.digest()).decode('utf-8')
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "OK-ACCESS-KEY": api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": passphrase
+    }
+    if IS_SANDBOX:
+        headers["x-simulated-trading"] = "1"
+
+    try:
+        req = Request(f"{base_url}{request_path}", headers=headers, method="GET")
+        with urlopen(req, timeout=6) as resp:
+            resp_data = json.loads(resp.read().decode('utf-8'))
+            code = str(resp_data.get("code", ""))
+            msg = resp_data.get("msg", "")
+            report["details"] = {
+                "http_status": resp.status,
+                "okx_code": code,
+                "okx_msg": msg,
+                "data": resp_data.get("data")
+            }
+            if code == "0":
+                report["permission_granted"] = True
+                report["status_verdict"] = "SUKCES: Klucz API posiada uprawnienia do natywnych botów Grid OKX!"
+            elif code in ("50100", "51000", "50101"):
+                report["permission_granted"] = False
+                report["status_verdict"] = f"BLOKADA UPRAWNIEŃ: Brak uprawnienia 'Trading Bot' (kod {code}: {msg})."
+            else:
+                report["permission_granted"] = False
+                report["status_verdict"] = f"ODPOWIEDŹ OKX: Kod {code} - {msg}"
+    except urllib.error.HTTPError as he:
+        err_body = he.read().decode('utf-8', errors='ignore')
+        report["details"] = {"http_status": he.code, "error_body": err_body}
+        report["status_verdict"] = f"BŁĄD HTTP {he.code}: Dostęp do endpointu zablokowany."
+    except Exception as e:
+        report["details"] = {"exception": str(e)}
+        report["status_verdict"] = f"WYJĄTEK POŁĄCZENIA: {e}"
+
+    return jsonify(report), 200
+
+# =========================================================================
 # TOKEN BUCKET RATE LIMITER
 # =========================================================================
 class TokenBucketRateLimiter:
