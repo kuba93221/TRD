@@ -46,7 +46,9 @@ logger.propagate = False
 print("🚀 [BOOT] Silnik transakcyjny v11.4 inicjalizuje telemetrie na Renderze...", flush=True)
 
 IS_SANDBOX = os.environ.get("OKX_IS_SANDBOX", "True").strip().lower() in ("true", "1", "yes")
-logger.info(f"⚙️ [SYSTEM-INIT] Silnik v11.4 Online [GLOBAL CACHE SINGLETON | CRIT FIXES APPLIED | LIVE: {not IS_SANDBOX}]")
+<comment-tag id="1">logger.info(f"⚙️ [SYSTEM-INIT] Silnik v11.4 Online [GLOBAL CACHE SINGLETON | CRIT FIXES APPLIED | LIVE: {not IS_SANDBOX}]")</comment-tag id="1" text="Zaktualizuj sygnaturę wersji:
+logger.info(f'⚙️ [SYSTEM-INIT] Silnik v11.5 Online [CRIT FIX: CANCEL-ALGOS APPLIED | LIVE: {not IS_SANDBOX}]')
+Podbicie wersji do v11.5 pozwala natychmiast upewnić się w konsoli Rendera, że uruchomił się kontener ze zaktualizowanym kodem." type="suggestion">
 
 BACKGROUND_LOOP: Optional[asyncio.AbstractEventLoop] = None
 GLOBAL_ALPHA_LOCK: Optional[asyncio.Lock] = None
@@ -174,7 +176,9 @@ logging.getLogger('werkzeug').setLevel(logging.WARNING)
 def health_check():
     if BACKGROUND_LOOP is None or not BACKGROUND_LOOP.is_running():
         return "TRADING_ENGINE_DOWN", 503
-    return "OK_v11.4_FUTURES_GRADE", 200
+<comment-tag id="2">    return "OK_v11.4_FUTURES_GRADE", 200</comment-tag id="2" text="Zmień na:
+    return 'OK_v11.5_FUTURES_GRADE', 200
+Umożliwia błyskawiczną weryfikację w przeglądarce pod adresem głównym, czy aktywna instancja to zaktualizowana wersja v11.5." type="suggestion">
 
 # =========================================================================
 # DIAGNOSTYKA AUTORYZACJI OKX EEA
@@ -1211,9 +1215,13 @@ class OKXSpotClient:
                     except ValueError:
                         actual_px = None
                     return state, actual_px
-                if code in ("51402", "51401", "51410", "51415"):
+<comment-tag id="3">                if code in ("51402", "51401", "51410", "51415"):
                     return "effective", None
+                return None, None</comment-tag id="3" text="Zmień na:
+                if (code == '0' and not data.get('data')) or code in ('51402', '51401', '51410', '51415'):
+                    return 'effective', None
                 return None, None
+Gdy zlecenie OCO zostało zrealizowane lub wygaszone, OKX zwraca code 0 i pustą listę data: []. Uznanie tego stanu za terminalny (effective) zapobiega zapętleniu procedury likwidacji." type="suggestion">
         except Exception as e:
             logger.error(f"❌ [OKX-ALGO-STATE] Błąd zlecenia Algo {algo_id}: {e}")
             return None, None
@@ -1295,7 +1303,9 @@ class OKXSpotClient:
             return False
         await self.rate_limiter.consume()
 
-        request_path = "/api/v5/trade/cancel-algo-orders"
+<comment-tag id="4">        request_path = "/api/v5/trade/cancel-algo-orders"</comment-tag id="4" text="Zmień na:
+        request_path = '/api/v5/trade/cancel-algos'
+Zgodnie z oficjalną specyfikacją OKX API v5 właściwy endpoint do odwoływania zleceń algorytmicznych OCO to /api/v5/trade/cancel-algos (bez przyrostka -orders). Poprzednia ścieżka zwracała błąd 404, blokując likwidację przeterminowanych pozycji przez Strażnika Czasu." type="suggestion">
         body_dict = [{"instId": symbol, "algoId": str(algo_id)}]
         body_json = json.dumps(body_dict)
         url = f"{self.base_url}{request_path}"
@@ -1310,9 +1320,14 @@ class OKXSpotClient:
                     SAFE_TERMINAL_CODES = ("0", "51410", "51401", "51415", "51402", "51400")
                     if s_code in SAFE_TERMINAL_CODES:
                         return True
-                    logger.warning(f"⚠️ [OKX-ALGO-CANCEL] Nieobsługiwany sCode {s_code}: {item.get('sMsg')}")
+<comment-tag id="5">                    logger.warning(f"⚠️ [OKX-ALGO-CANCEL] Nieobsługiwany sCode {s_code}: {item.get('sMsg')}")
                     return False
+                return False</comment-tag id="5" text="Zmień na:
+                    logger.warning(f'⚠️ [OKX-ALGO-CANCEL] Nieobsługiwany sCode {s_code}: {item.get(\'sMsg\')}')
+                    return False
+                logger.warning(f'⚠️ [OKX-ALGO-CANCEL-REJECTED] Błąd OKX: {data.get(\'code\')} - {data.get(\'msg\')}')
                 return False
+Dodanie jawnego logowania kodu i treści błędu ułatwia natychmiastową diagnostykę, gdyby giełda odrzuciła anulowanie zlecenia." type="suggestion">
         except Exception as e:
             logger.error(f"❌ [OKX-CANCEL-ALGO] Błąd OCO {algo_id}: {e}")
             return False
